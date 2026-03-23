@@ -1,0 +1,11 @@
+pandas
+numpy
+pycountry
+geopy
+python-dotenv
+statsmodels
+scipy
+fpdf2
+pytrends-modern
+urllib3
+pyarrow
