@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+
+{% block title %}B2BTrend Workspaces{% endblock %}
+
+{% block content %}
+<main class="layout" id="workspace-root" data-workspaces='{{ workspaces | tojson }}'>
+  <section class="topbar card">
+    <div>
+      <p class="eyebrow">B2BTrend</p>
+      <h1>Workspace Hub</h1>
+      <p class="subtitle">Projeleri tek ekrandan yonet: sec, varsayilan yap, duzenle, sil, yeni ekle</p>
+    </div>
+    <div class="toolbar-inline">
+      <label>Tema</label>
+      <div class="theme-toggle" role="group" aria-label="Tema secimi">
+        <button type="button" class="btn theme-btn" data-theme="system">Sistem</button>
+        <button type="button" class="btn theme-btn" data-theme="light">Acik</button>
+        <button type="button" class="btn theme-btn" data-theme="dark">Koyu</button>
+      </div>
+      <div class="status-wrap">
+        <span class="status-dot" id="ws-indicator"></span>
+        <span id="ws-label">Arkaplan veri cekimi izleniyor...</span>
+      </div>
+      <a class="btn btn-primary" href="/dashboard">Dashboard Ac</a>
+      <button id="ws-new-btn" class="btn icon-btn" title="Yeni Workspace">+</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="workspace-grid" id="workspace-grid"></div>
+  </section>
+
+  <dialog id="ws-dialog" class="modal">
+    <form method="dialog" id="ws-form">
+      <h3 id="ws-form-title">Yeni Workspace</h3>
+      <input type="hidden" id="ws-id" />
+
+      <label>Ad</label>
+      <input id="ws-name" required placeholder="Orn: tavuk_uluk" />
+
+      <label>Keyword veya Topic ID</label>
+      <input id="ws-keyword" required value="/m/02vqb5x" />
+
+      <label>Ulkeler (CC, virgulle)</label>
+      <input id="ws-countries" value="TR,US,DE" />
+
+      <label class="inline-check">
+        <input id="ws-topic-mode" type="checkbox" /> Google Topic ID modu (/m/...)
+      </label>
+
+      <label>Ulkeye Ozel Anahtar Kelimeler (CC:kelime)</label>
+      <textarea id="ws-country-keywords" rows="5" placeholder="TR:tavuk&#10;US:chicken&#10;DE:huhn"></textarea>
+
+      <div class="modal-actions">
+        <button type="submit" class="btn btn-primary">Kaydet</button>
+        <button type="button" id="ws-cancel" class="btn">Iptal</button>
+      </div>
+    </form>
+  </dialog>
+
+  <section class="toast" id="toast"></section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/workspace.js"></script>
+{% endblock %}

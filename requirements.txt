@@ -6,6 +6,11 @@ python-dotenv
 statsmodels
 scipy
 fpdf2
-pytrends-modern
+pytrends-modern[]
 urllib3
 pyarrow
+fastapi
+jinja2
+uvicorn
+websocket-client
+plotly

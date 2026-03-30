@@ -4,11 +4,11 @@
 [![Python tests (3.12)](https://github.com/oneoblomov/B2BTrend/actions/workflows/python-tests.yml/badge.svg?branch=main&event=push)](https://github.com/oneoblomov/B2BTrend/actions/workflows/python-tests.yml)
 [![Integration test](https://github.com/oneoblomov/B2BTrend/actions/workflows/python-tests.yml/badge.svg?branch=main&event=workflow_dispatch)](https://github.com/oneoblomov/B2BTrend/actions/workflows/python-tests.yml)
 
-**Hafif, sade ve üretime hazır bir Google Trends analiz arayüzü**.
+**Hafif, sade ve üretime hazır bir Google Trends analiz arayüzü (FastAPI + Jinja2)**.
 
 ## Tanıtım
 
-B2BTrend, Google Trends verisini anahtar kelime / Topic ID bazında hızlıca çekip görselleştiren ve raporlayan Python + Streamlit uygulamasıdır. Şehir/ülke kırılımı, zamana göre ilgi düzeyi, cache/takip grafikleri ve uyarı sinyalleri sağlar.
+B2BTrend, Google Trends verisini anahtar kelime / Topic ID bazında hızlıca çekip görselleştiren ve raporlayan Python + FastAPI uygulamasıdır. Jinja2 tabanlı HTML/CSS/JS arayüz, Plotly interaktif grafikler, şehir/ülke kırılımı, cache/takip grafikleri ve uyarı sinyalleri sağlar.
 
 ## Öne çıkan avantajlar
 
@@ -51,12 +51,21 @@ cp .env.example .env
 6. Uygulamayı başlatın:
 
 ```bash
-streamlit run app.py
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+7. Tarayıcıdan açın:
+
+```bash
+http://127.0.0.1:8000
 ```
 
 ## Yapı ve önemli dosyalar
 
-- `app.py`: Streamlit arayüzü başlatma.
+- `app.py`: FastAPI sunucusu, API uçları, Jinja2 render ve WebSocket durumu.
+- `templates/`: Jinja2 HTML şablonları.
+- `static/css/`: modern minimalist stil dosyaları.
+- `static/js/`: API istemcisi, Plotly render, WebSocket olayları.
 - `src/trend_fetcher.py`: Google Trends API çağrılarını yürütür, cache ve snapshot oluşturur.
 - `src/analytics.py`: trend, uyarı, sinyal analizleri.
 - `src/reports.py`: görüntü raporları, PDF, JSON çıktı.
@@ -69,12 +78,13 @@ streamlit run app.py
 
 ## Kullanım akışı
 
-1. Arayüzde anahtar kelime / Topic ID ve ülke/şehir seçilir.
-2. `fetch_trends_dataset()` çağrılır (şehir + timeline API çağrıları).
+1. Arayüzde workspace seçilir (keyword/topic, ülkeler, dil ayarı).
+2. `/api/fetch` ile `fetch_trends_dataset()` çağrılır (şehir + timeline API çağrıları).
 3. Çekilen veriler dairesel cache’e kaydedilir (`data/cache/`), TTL ve boyut uygulanır.
 4. Workspace verisi `data/workspaces/<workspace_id>/dataset.csv` dosyasina tek CSV olarak yazilir.
 5. Workspace ayarlari (arama metni, ulkeler vb.) `metadata.json` icinde tutulur.
-6. `src/analytics.py` ile trend sinyalleri ve istatistikler hesaplanır.
+6. `/api/dashboard` ile `src/analytics.py` tabanlı metrikler hesaplanır ve Plotly figürleri JSON olarak döner.
+7. Frontend (`static/js/app.js`) Plotly ile grafikleri interaktif render eder.
 
 ## Özelleştirme ve gelişmiş kullanım
 

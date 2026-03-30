@@ -1,14 +1,33 @@
 {
   "id": "tavuk_uluk",
-  "name": "Tavuk\u00e7uluk",
+  "name": "tavuk_uluk",
   "language": "tr",
   "keyword": "/m/02vqb5x",
   "countries": [
-    "TR"
+    "AR",
+    "BD",
+    "BR",
+    "CN",
+    "CO",
+    "EG",
+    "ID",
+    "IN",
+    "JP",
+    "KR",
+    "MY",
+    "NG",
+    "PH",
+    "PK",
+    "RU",
+    "SA",
+    "TH",
+    "TR",
+    "VN",
+    "ZA"
   ],
   "use_topic_mode": false,
   "country_keywords": {},
-  "created_at": "2026-03-23T09:43:55",
-  "updated_at": "2026-03-23T09:46:12",
+  "created_at": "2026-03-27T10:20:14",
+  "updated_at": "2026-03-27T10:20:14",
   "dataset_rows": 487
 }

@@ -4,7 +4,7 @@ from unittest.mock import Mock
 import pandas as pd
 import pytest
 
-from src.trend_fetcher import _build_client, _score_col, FetchConfig, fetch_country_cities, fetch_timeline
+from src.trend_fetcher import _build_client, _score_col, FetchConfig, fetch_country_cities, fetch_timeline, fetch_hourly_data, fetch_related_queries, fetch_related_topics
 
 
 def test_score_col_returns_first_numeric_column():
@@ -45,6 +45,30 @@ def test_fetch_timeline_with_mocked_client():
     assert result.iloc[0]["score"] == 42
 
 
+def test_fetch_related_queries_handles_build_payload_error():
+    cfg = FetchConfig(use_cache=False)
+    client = Mock()
+    client.build_payload.side_effect = Exception("Network unavailable")
+
+    result = fetch_related_queries(client, "US", cfg)
+
+    assert "top" in result and "rising" in result
+    assert result["top"].empty
+    assert result["rising"].empty
+
+
+def test_fetch_related_topics_handles_build_payload_error():
+    cfg = FetchConfig(use_cache=False)
+    client = Mock()
+    client.build_payload.side_effect = Exception("Network unavailable")
+
+    result = fetch_related_topics(client, "US", cfg)
+
+    assert "top" in result and "rising" in result
+    assert result["top"].empty
+    assert result["rising"].empty
+
+
 @pytest.mark.integration
 def test_fetch_timeline_integration_one_geo():
     # Çok yavaş olabilir, sadece tek bir veri çağrısı için.
@@ -59,3 +83,13 @@ def test_fetch_timeline_integration_one_geo():
     assert not result.empty
     assert "date" in result.columns
     assert "score" in result.columns
+
+
+def test_fetch_hourly_data_handles_build_payload_error():
+    cfg = FetchConfig(use_cache=False)
+    client = Mock()
+    client.build_payload.side_effect = Exception("429 too many requests")
+
+    result = fetch_hourly_data("US", config=cfg)
+
+    assert result.empty

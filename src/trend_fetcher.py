@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import pandas as pd
 from urllib3.util.retry import Retry
@@ -108,6 +108,24 @@ def _score_col(df: pd.DataFrame) -> str:
 
 def _sleep(cfg: FetchConfig) -> None:
     time.sleep(random.uniform(cfg.min_sleep_sec, cfg.max_sleep_sec))
+
+
+def _emit_progress(progress_callback: Callable[[dict], None] | None, payload: dict) -> None:
+    if not progress_callback:
+        return
+    try:
+        progress_callback(payload)
+    except Exception:
+        pass
+
+
+class FetchCancelledError(RuntimeError):
+    pass
+
+
+def _check_cancel(cancel_callback: Callable[[], bool] | None) -> None:
+    if cancel_callback and cancel_callback():
+        raise FetchCancelledError("Fetch cancelled")
 
 
 # ── Dosya Tabanlı Cache ───────────────────────────────────────
@@ -247,9 +265,8 @@ def fetch_related_queries(
         if cached_top is not None and cached_rising is not None:
             return {"top": cached_top, "rising": cached_rising}
 
-    client.build_payload([kw], cat=0, timeframe=cfg.timeframe_12m, geo=geo, gprop="")
-
     try:
+        client.build_payload([kw], cat=0, timeframe=cfg.timeframe_12m, geo=geo, gprop="")
         related = client.related_queries()
     except Exception:
         return {"top": pd.DataFrame(), "rising": pd.DataFrame()}
@@ -288,9 +305,8 @@ def fetch_related_topics(
         if cached_top is not None and cached_rising is not None:
             return {"top": cached_top, "rising": cached_rising}
 
-    client.build_payload([kw], cat=0, timeframe=cfg.timeframe_12m, geo=geo, gprop="")
-
     try:
+        client.build_payload([kw], cat=0, timeframe=cfg.timeframe_12m, geo=geo, gprop="")
         related = client.related_topics()
     except Exception:
         return {"top": pd.DataFrame(), "rising": pd.DataFrame()}
@@ -318,31 +334,104 @@ def fetch_trends_dataset(
     countries: Iterable[str] | None = None,
     config: FetchConfig | None = None,
     proxies: list[str] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+    progress_context: dict[str, object] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Tüm ülkeler için şehir skorları + zaman serileri çeker."""
     cfg = config or FetchConfig()
     country_list = list(countries or TOP_20_COUNTRIES)
     proxy_list = proxies or PROXIES or None
+    total_steps = max(1, len(country_list) * (cfg.top_cities_per_country + 2))
+    completed_steps = 0
+    _check_cancel(cancel_callback)
+    context = dict(progress_context or {})
+    display_country_total = int(context.get("country_total") or len(country_list))
+    display_country_index = int(context.get("country_index") or 0)
+    display_country_label = str(context.get("country_label") or "").strip()
+
+    def country_message(country: str, index: int) -> str:
+        if display_country_label:
+            return display_country_label
+        label = display_country_label or country
+        label_index = display_country_index or index
+        label_total = display_country_total or len(country_list)
+        if label_total > 1 or label_index > 1:
+            return f"{label} ({label_index}/{label_total})"
+        return label
 
     all_cities: list[pd.DataFrame] = []
     all_timelines: list[pd.DataFrame] = []
 
     client = _build_client(cfg, proxy_list)
+    _emit_progress(
+        progress_callback,
+        {
+            "status": "running",
+            "phase": "prepare",
+            "message": f"{len(country_list)} ulke icin veri cekimi hazirlaniyor",
+            "completed": completed_steps,
+            "total": total_steps,
+            "progress": 0.0,
+        },
+    )
 
-    for country in country_list:
+    for index, country in enumerate(country_list, start=1):
+        _check_cancel(cancel_callback)
+        country_label = country_message(country, index)
+        _emit_progress(
+            progress_callback,
+            {
+                "status": "running",
+                "phase": "country_start",
+                "country": country,
+                "message": f"{country_label} icin veri cekiliyor",
+                "completed": completed_steps,
+                "total": total_steps,
+                "progress": completed_steps / total_steps,
+            },
+        )
         for attempt in range(1, cfg.max_attempt_per_country + 1):
             try:
+                _check_cancel(cancel_callback)
                 city_df = fetch_country_cities(client, country, cfg)
+                completed_steps += 1
+                _emit_progress(
+                    progress_callback,
+                    {
+                        "status": "running",
+                        "phase": "city_list",
+                        "country": country,
+                        "message": f"{country_label} sehir listesi alindi",
+                        "completed": completed_steps,
+                        "total": total_steps,
+                        "progress": min(0.99, completed_steps / total_steps),
+                    },
+                )
                 if city_df.empty:
                     break
                 all_cities.append(city_df)
 
-                timeline_added = 0
                 for _, crow in city_df.iterrows():
+                    _check_cancel(cancel_callback)
                     geo = crow["geo_code"]
                     if not geo:
+                        completed_steps += 1
                         continue
                     try:
+                        _emit_progress(
+                            progress_callback,
+                            {
+                                "status": "running",
+                                "phase": "city_timeline",
+                                "country": country,
+                                "city": crow["city"],
+                                "message": f"{country_label} / {crow['city']} zaman serisi cekiliyor",
+                                "completed": completed_steps,
+                                "total": total_steps,
+                                "progress": min(0.99, completed_steps / total_steps),
+                            },
+                        )
                         ts = fetch_timeline(client, geo, cfg)
                         if not ts.empty:
                             ts = ts.copy()
@@ -350,14 +439,29 @@ def fetch_trends_dataset(
                             ts["city"] = crow["city"]
                             ts["geo_code"] = geo
                             all_timelines.append(ts)
-                            timeline_added += 1
                     except Exception:
                         continue
+                    finally:
+                        completed_steps += 1
+                    _check_cancel(cancel_callback)
                     _sleep(cfg)
 
                 # Ülke seviyesinde zaman serisini de ekle.
                 # Bu, ülke haritası / korelasyon gibi ülke genelinde analizlerde doğru temel sağlar.
                 try:
+                    _check_cancel(cancel_callback)
+                    _emit_progress(
+                        progress_callback,
+                        {
+                            "status": "running",
+                            "phase": "country_timeline",
+                            "country": country,
+                            "message": f"{country_label} ulke bazli zaman serisi cekiliyor",
+                            "completed": completed_steps,
+                            "total": total_steps,
+                            "progress": min(0.99, completed_steps / total_steps),
+                        },
+                    )
                     country_ts = fetch_timeline(client, country, cfg)
                     if not country_ts.empty:
                         country_ts = country_ts.copy()
@@ -367,6 +471,8 @@ def fetch_trends_dataset(
                         all_timelines.append(country_ts)
                 except Exception:
                     pass
+                finally:
+                    completed_steps += 1
 
                 break
 
@@ -375,8 +481,10 @@ def fetch_trends_dataset(
                     break
                 wait = min(90, (2 ** attempt) * random.uniform(2.0, 4.5))
                 time.sleep(wait)
+                _check_cancel(cancel_callback)
                 client = _build_client(cfg, proxy_list)
             finally:
+                _check_cancel(cancel_callback)
                 _sleep(cfg)
 
     cities_df = pd.DataFrame(columns=["country", "city", "geo_code", "score"])
@@ -400,6 +508,18 @@ def fetch_trends_dataset(
             .reset_index(drop=True)
         )
 
+    _emit_progress(
+        progress_callback,
+        {
+            "status": "running",
+            "phase": "finalize",
+            "message": "Veri birlestiriliyor",
+            "completed": total_steps,
+            "total": total_steps,
+            "progress": 0.99,
+        },
+    )
+
     return cities_df, timeline_df
 
 
@@ -409,6 +529,8 @@ def fetch_trends_dataset_country_keywords(
     default_keyword: str,
     config: FetchConfig | None = None,
     proxies: list[str] | None = None,
+    progress_callback: Callable[[dict], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Fetches trends data per country using country-specific keywords.
 
@@ -418,11 +540,82 @@ def fetch_trends_dataset_country_keywords(
     country_list = list(countries)
     all_cities: list[pd.DataFrame] = []
     all_timeline: list[pd.DataFrame] = []
+    total_steps = max(1, len(country_list) * (base_cfg.top_cities_per_country + 2))
+    _check_cancel(cancel_callback)
 
-    for country in country_list:
+    _emit_progress(
+        progress_callback,
+        {
+            "status": "running",
+            "phase": "prepare",
+            "message": f"{len(country_list)} ulke icin ozel keyword cekimi hazirlaniyor",
+            "completed": 0,
+            "total": total_steps,
+            "progress": 0.0,
+        },
+    )
+
+    for index, country in enumerate(country_list, start=1):
+        _check_cancel(cancel_callback)
         kw = str(keyword_by_country.get(country, "")).strip() or str(default_keyword).strip() or DEFAULT_KEYWORD
         cfg = FetchConfig(**{**base_cfg.__dict__, "keyword": kw})
-        cities_df, timeline_df = fetch_trends_dataset(countries=[country], config=cfg, proxies=proxies)
+        country_start = (index - 1) / max(1, len(country_list))
+        country_span = 1 / max(1, len(country_list))
+        country_label = f"{country} ({index}/{len(country_list)})"
+
+        _emit_progress(
+            progress_callback,
+            {
+                "status": "running",
+                "phase": "country_keyword",
+                "country": country,
+                "keyword": kw,
+                "country_index": index,
+                "country_total": len(country_list),
+                "message": f"{country_label} icin {kw} ile veri cekiliyor",
+                "completed": int(country_start * total_steps),
+                "total": total_steps,
+                "progress": country_start,
+            },
+        )
+
+        def country_progress_callback(payload: dict, *, _start=country_start, _span=country_span) -> None:
+            _check_cancel(cancel_callback)
+            data = dict(payload or {})
+            inner_progress = float(data.get("progress") or 0.0)
+            overall_progress = min(0.99, _start + inner_progress * _span)
+            phase = str(data.get("phase") or "")
+            if phase == "country_start":
+                data["message"] = f"{country_label} icin {kw} ile veri cekiliyor"
+            elif phase == "city_list":
+                data["message"] = f"{country_label} sehir listesi aliniyor"
+            elif phase == "city_timeline" and data.get("city"):
+                data["message"] = f"{country_label} / {data['city']} zaman serisi cekiliyor"
+            elif phase == "country_timeline":
+                data["message"] = f"{country_label} ulke bazli zaman serisi cekiliyor"
+            elif phase == "finalize":
+                data["message"] = "Ozel keyword verisi birlestiriliyor"
+            data["progress"] = overall_progress
+            data["total"] = total_steps
+            data["completed"] = min(total_steps, max(0, int(overall_progress * total_steps)))
+            data.setdefault("country", country)
+            data.setdefault("keyword", kw)
+            data.setdefault("country_index", index)
+            data.setdefault("country_total", len(country_list))
+            _emit_progress(progress_callback, data)
+
+        cities_df, timeline_df = fetch_trends_dataset(
+            countries=[country],
+            config=cfg,
+            proxies=proxies,
+            progress_callback=country_progress_callback,
+            progress_context={
+                "country_index": index,
+                "country_total": len(country_list),
+                "country_label": country_label,
+            },
+            cancel_callback=cancel_callback,
+        )
         if not cities_df.empty:
             all_cities.append(cities_df)
         if not timeline_df.empty:
@@ -442,6 +635,18 @@ def fetch_trends_dataset_country_keywords(
         timeline_out = timeline_out.dropna(subset=["date"])
         timeline_out = timeline_out.drop_duplicates(subset=["country", "city", "geo_code", "date"], keep="last")
         timeline_out = timeline_out.sort_values(["country", "city", "date"]).reset_index(drop=True)
+
+    _emit_progress(
+        progress_callback,
+        {
+            "status": "running",
+            "phase": "finalize",
+            "message": "Ozel keyword verisi birlestiriliyor",
+            "completed": total_steps,
+            "total": total_steps,
+            "progress": 0.99,
+        },
+    )
 
     return cities_out, timeline_out
 
@@ -464,7 +669,11 @@ def fetch_hourly_data(
             return cached
 
     client = _build_client(cfg, proxy_list)
-    client.build_payload([kw], cat=0, timeframe=cfg.timeframe_7d, geo=geo, gprop="")
+
+    try:
+        client.build_payload([kw], cat=0, timeframe=cfg.timeframe_7d, geo=geo, gprop="")
+    except Exception:
+        return pd.DataFrame(columns=["datetime", "score", "hour", "dayofweek"])
 
     try:
         ts = client.interest_over_time()

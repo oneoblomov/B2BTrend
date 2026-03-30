@@ -1,33 +1,25 @@
-"""B2BTrend — Profesyonel Dashboard.
-
-Herhangi bir anahtar kelime veya Google Trends Topic ID ile çalışır.
-Çok dilli, modern, minimalist, dinamik görselleştirme.
-İleri seviye zaman serisi analizi: STL, Change Point, Ensemble Forecast.
-Google Trends tarzi interaktif harita drill-down.
-"""
 from __future__ import annotations
 
+import asyncio
+import io
+import json
+import threading
+from datetime import date
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import plotly.io as pio
 import pycountry
-import streamlit as st
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from geopy.geocoders import Nominatim
+from plotly.subplots import make_subplots
+from pydantic import BaseModel, Field
 
-from src.config import (
-    ALL_COUNTRIES,
-    DEFAULT_LANGUAGE,
-    DEFAULT_KEYWORD,
-    GEOCACHE_FILE,
-    SUPPORTED_LANGUAGES,
-    TIMEFRAME_OPTIONS,
-    TOP_20_COUNTRIES,
-    t,
-)
 from src.analytics import (
     advanced_forecast,
     best_ad_hours_text,
@@ -47,20 +39,25 @@ from src.analytics import (
     stl_decompose,
     trend_strength_meter,
 )
-from src.reports import export_csv, generate_pdf_report
+from src.config import ALL_COUNTRIES, DEFAULT_KEYWORD, GEOCACHE_FILE, TOP_20_COUNTRIES
+from src.fetch_job_store import FetchJobStore, JobConflictError
+from src.reports import export_csv
 from src.trend_fetcher import (
     FetchConfig,
+    FetchCancelledError,
+    _build_client,
     clear_cache,
     fetch_hourly_data,
     fetch_related_queries,
     fetch_related_topics,
-    fetch_trends_dataset_country_keywords,
     fetch_trends_dataset,
-    _build_client,
+    fetch_trends_dataset_country_keywords,
+    save_snapshot,
 )
 from src.workspace_store import (
     create_workspace,
     delete_workspace,
+    ensure_default_workspace,
     get_default_workspace_id,
     list_workspaces,
     load_workspace_dataset,
@@ -71,230 +68,283 @@ from src.workspace_store import (
     workspace_summary,
 )
 
+ROOT = Path(__file__).resolve().parent
+TEMPLATES_DIR = ROOT / "templates"
+STATIC_DIR = ROOT / "static"
 
-# ══════════════════════════════════════════════════════════════
-#  SAYFA KONFİGÜRASYONU
-# ══════════════════════════════════════════════════════════════
-
-st.set_page_config(
-    page_title=t(DEFAULT_LANGUAGE, "app_title"),
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+app = FastAPI(title="B2BTrend", version="4.2.0")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
-# ══════════════════════════════════════════════════════════════
-#  MODERN MİNİMALİST CSS
-# ══════════════════════════════════════════════════════════════
-
-st.markdown("""
-<style>
-    /* ── Global ── */
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-
-    .stApp {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    }
-
-    /* ── Sidebar ── */
-    [data-testid="stSidebar"] {
-        min-width: 300px;
-        background: linear-gradient(180deg, #0f0f23 0%, #1a1a3e 100%);
-        transition: min-width 0.3s ease, width 0.3s ease;
-    }
-    /* When the sidebar is collapsed we no longer keep a fixed min-width, avoiding an empty blank strip */
-    [data-testid="stSidebar"][aria-expanded="false"] {
-        min-width: 0px !important;
-        width: 0px !important;
-    }
-    [data-testid="stSidebar"] * {
-        color: #e0e0e0 !important;
-    }
-    [data-testid="stSidebar"] .stSelectbox label,
-    [data-testid="stSidebar"] .stMultiSelect label,
-    [data-testid="stSidebar"] .stSlider label {
-        color: #a0a0c0 !important;
-        font-size: 0.85rem;
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-
-    /* ── Metrics ── */
-    div[data-testid="stMetric"] {
-        background: linear-gradient(135deg, #667eea11 0%, #764ba211 100%);
-        border-radius: 12px;
-        padding: 16px;
-        border: 1px solid #667eea22;
-        backdrop-filter: blur(10px);
-    }
-    div[data-testid="stMetric"] label {
-        font-size: 0.75rem !important;
-        font-weight: 600 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.8px;
-        opacity: 0.7;
-    }
-    div[data-testid="stMetric"] [data-testid="stMetricValue"] {
-        font-size: 1.8rem !important;
-        font-weight: 700 !important;
-    }
-
-    /* ── Tabs ── */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 4px;
-        background: transparent;
-        border-bottom: 2px solid #667eea22;
-        padding-bottom: 0;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 8px 8px 0 0;
-        padding: 10px 20px;
-        font-weight: 500;
-        font-size: 0.85rem;
-        letter-spacing: 0.3px;
-    }
-    .stTabs [aria-selected="true"] {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white !important;
-    }
-
-    /* ── Cards / Containers ── */
-    [data-testid="stExpander"] {
-        border: 1px solid #667eea22;
-        border-radius: 12px;
-        overflow: hidden;
-    }
-
-    /* ── Search Bar ── */
-    .search-container {
-        background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
-        border: 2px solid #667eea33;
-        border-radius: 16px;
-        padding: 24px;
-        margin-bottom: 24px;
-        backdrop-filter: blur(10px);
-    }
-    .search-title {
-        font-size: 1.6rem;
-        font-weight: 700;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 12px;
-    }
-
-    /* ── Strength Gauge ── */
-    .strength-bar {
-        height: 8px;
-        border-radius: 4px;
-        background: #e0e0e0;
-        overflow: hidden;
-    }
-    .strength-fill {
-        height: 100%;
-        border-radius: 4px;
-        transition: width 0.5s ease;
-    }
-
-    /* ── Data table ── */
-    .stDataFrame {
-        border-radius: 12px;
-        overflow: hidden;
-    }
-
-    /* ── Divider ── */
-    hr {
-        border: none;
-        border-top: 1px solid #667eea15;
-        margin: 16px 0;
-    }
-
-    /* ── Hide Streamlit branding ── */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-
-    /* ── Info/Warning ── */
-    .stAlert {
-        border-radius: 12px;
-    }
-
-    /* ── Button ── */
-    .stButton > button {
-        border-radius: 12px !important;
-        border: 1px solid rgba(80, 110, 160, 0.22) !important;
-        background: linear-gradient(150deg, rgba(255,255,255,0.86), rgba(245,248,255,0.95)) !important;
-        color: #16324f !important;
-        font-weight: 600;
-        letter-spacing: 0.3px;
-        transition: all 0.2s ease;
-        text-align: left !important;
-    }
-    .stButton > button:hover {
-        border-color: rgba(102, 126, 234, 0.5) !important;
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15) !important;
-        transform: translateY(-2px);
-        background: linear-gradient(150deg, rgba(255,255,255,0.95), rgba(245,248,255,1)) !important;
-    }
-
-    /* Workspace cards */
-    .ws-grid-note {
-        opacity: 0.7;
-        font-size: 0.9rem;
-        margin: 0 0 16px 0;
-    }
-    .ws-card {
-        border: 1px solid rgba(80, 110, 160, 0.22);
-        background: linear-gradient(150deg, rgba(255,255,255,0.86), rgba(245,248,255,0.95));
-        border-radius: 16px;
-        padding: 14px 16px;
-        margin-bottom: 10px;
-    }
-    .ws-card-title {
-        font-size: 1rem;
-        font-weight: 700;
-        color: #16324f;
-    }
-    .ws-chip {
-        display: inline-block;
-        background: #edf3ff;
-        color: #1d4e89;
-        border: 1px solid rgba(29,78,137,0.18);
-        border-radius: 999px;
-        padding: 2px 8px;
-        font-size: 0.75rem;
-        margin-top: 6px;
-    }
-    .ws-stats {
-        margin-top: 10px;
-        font-size: 0.86rem;
-        color: #355070;
-    }
-</style>
-""", unsafe_allow_html=True)
+class WorkspaceCreate(BaseModel):
+    name: str
+    keyword: str = DEFAULT_KEYWORD
+    countries: list[str] = Field(default_factory=lambda: list(TOP_20_COUNTRIES))
+    language: str = "tr"
+    use_topic_mode: bool = False
+    country_keywords: dict[str, str] = Field(default_factory=dict)
 
 
-# ══════════════════════════════════════════════════════════════
-#  YARDIMCI FONKSİYONLAR
-# ══════════════════════════════════════════════════════════════
+class WorkspaceUpdate(BaseModel):
+    name: str | None = None
+    keyword: str | None = None
+    countries: list[str] | None = None
+    language: str | None = None
+    use_topic_mode: bool | None = None
+    country_keywords: dict[str, str] | None = None
+    is_default: bool | None = None
+
+
+class FetchRequest(BaseModel):
+    workspace_id: str
+
+
+class FetchCancelRequest(BaseModel):
+    workspace_id: str | None = None
+
+
+class WsHub:
+    def __init__(self) -> None:
+        self.connections: set[WebSocket] = set()
+
+    async def connect(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self.connections.add(ws)
+
+    def disconnect(self, ws: WebSocket) -> None:
+        self.connections.discard(ws)
+
+    async def broadcast(self, payload: dict) -> None:
+        stale: list[WebSocket] = []
+        for ws in self.connections:
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self.disconnect(ws)
+
+
+hub = WsHub()
+fetch_job_store = FetchJobStore()
+
+
+def _schedule_broadcast(loop: asyncio.AbstractEventLoop, payload: dict) -> None:
+    try:
+        asyncio.run_coroutine_threadsafe(hub.broadcast(payload), loop)
+    except Exception:
+        pass
+
+
+def _language_to_hl(language: str) -> str:
+    code = str(language or "tr").strip().lower() or "tr"
+    if code == "tr":
+        return "tr-TR"
+    if len(code) == 2:
+        return f"{code}-{code.upper()}"
+    return "en-US"
+
+
+def _job_update(job_id: str, loop: asyncio.AbstractEventLoop, payload: dict) -> dict | None:
+    snapshot = fetch_job_store.snapshot()
+    active = snapshot.get("active") or {}
+    incoming_status = str((payload or {}).get("status") or "")
+    if active.get("job_id") == job_id and active.get("status") == "cancelling" and incoming_status == "running":
+      return active
+    updated = fetch_job_store.update_job(job_id, **payload)
+    if updated:
+        _schedule_broadcast(loop, {"type": "fetch_job_update", "state": updated})
+    return updated
+
+
+def _is_job_cancel_requested(job_id: str) -> bool:
+    snapshot = fetch_job_store.snapshot()
+    active = snapshot.get("active") or snapshot.get("latest") or {}
+    return bool(active and active.get("job_id") == job_id and (active.get("cancel_requested") or active.get("status") == "cancelling"))
+
+
+def _run_fetch_job(
+    job_id: str,
+    loop: asyncio.AbstractEventLoop,
+    *,
+    workspace_id: str,
+    keyword: str,
+    countries: list[str],
+    language: str,
+    use_topic_mode: bool,
+    country_keywords: dict[str, str],
+) -> None:
+    hl = _language_to_hl(language)
+    cfg = FetchConfig(
+        keyword=keyword,
+        hl=hl,
+        retries=3,
+        backoff_factor=0.6,
+        max_attempt_per_country=4,
+        top_cities_per_country=10,
+        min_sleep_sec=max(5.0, 4.0),
+        max_sleep_sec=max(10.0, 9.0),
+    )
+
+    _job_update(
+        job_id,
+        loop,
+        {
+            "status": "running",
+            "phase": "prepare",
+            "message": "Veri cekimi arkaplanda basladi",
+            "progress": 0.02,
+            "completed": 0,
+            "total": max(1, len(countries) * 12),
+        },
+    )
+
+    def progress_callback(payload: dict) -> None:
+        data = dict(payload or {})
+        data.setdefault("status", "running")
+        data.setdefault("phase", "running")
+        _job_update(job_id, loop, data)
+
+    try:
+        if use_topic_mode:
+            cities, timeline = fetch_trends_dataset(
+                countries,
+                cfg,
+                progress_callback=progress_callback,
+                cancel_callback=lambda: _is_job_cancel_requested(job_id),
+            )
+        else:
+            cities, timeline = fetch_trends_dataset_country_keywords(
+                countries,
+                country_keywords,
+                keyword,
+                cfg,
+                progress_callback=progress_callback,
+                cancel_callback=lambda: _is_job_cancel_requested(job_id),
+            )
+
+        if cities.empty or timeline.empty:
+            # Dataset empty olsa bile bu durum exploit edilebilir; hata yap31lm315f saymayal31m.
+            save_workspace_dataset(workspace_id, cities, timeline)
+            try:
+                save_snapshot(cities, timeline, keyword=keyword)
+            except Exception:
+                pass
+
+            final = fetch_job_store.finish_job(
+                job_id,
+                status="completed",
+                message="Veri cekimi tamamlandi (veri yok).",
+                result={"cities": int(len(cities)), "timeline": int(len(timeline))},
+            )
+            if final:
+                _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
+                _schedule_broadcast(loop, {"type": "fetch_done", "state": final})
+            return
+
+        save_workspace_dataset(workspace_id, cities, timeline)
+        try:
+            save_snapshot(cities, timeline, keyword=keyword)
+        except Exception:
+            pass
+
+        final = fetch_job_store.finish_job(
+            job_id,
+            status="completed",
+            message=f"Veri cekimi tamamlandi: {len(cities)} sehir, {len(timeline)} satir",
+            result={"cities": int(len(cities)), "timeline": int(len(timeline))},
+        )
+        if final:
+            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
+            _schedule_broadcast(loop, {"type": "fetch_done", "state": final})
+    except FetchCancelledError:
+        final = fetch_job_store.update_job(
+            job_id,
+            status="cancelled",
+            phase="cancelled",
+            message="Veri cekimi iptal edildi",
+        )
+        if final:
+            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
+            _schedule_broadcast(loop, {"type": "fetch_cancelled", "state": final})
+    except Exception as exc:
+        message = f"Veri cekimi basarisiz: {exc}"
+        final = fetch_job_store.finish_job(
+            job_id,
+            status="failed",
+            message=message,
+            error=str(exc),
+        )
+        if final:
+            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
+            _schedule_broadcast(loop, {"type": "fetch_failed", "state": final})
+
+
+def _fig_to_dict(fig: go.Figure) -> dict:
+    return json.loads(pio.to_json(fig))
+
 
 def _country_iso3(iso2: str) -> str:
-    c = pycountry.countries.get(alpha_2=iso2)
-    return c.alpha_3 if c else iso2
+    country = pycountry.countries.get(alpha_2=str(iso2).upper())
+    return country.alpha_3 if country else str(iso2).upper()
 
 
 def _country_name(iso2: str) -> str:
-    c = pycountry.countries.get(alpha_2=iso2)
-    return c.name if c else iso2
-
-def _workspace_label(meta: dict) -> str:
-    name = str(meta.get("name") or meta.get("id") or "workspace")
-    keyword = str(meta.get("keyword") or DEFAULT_KEYWORD)
-    return f"{name}  ·  {keyword}"
+    country = pycountry.countries.get(alpha_2=str(iso2).upper())
+    return country.name if country else str(iso2).upper()
 
 
-# ── Geocoding ─────────────────────────────────────────────────
+def _clean_country_keywords(mapping: dict[str, str], allowed: list[str]) -> dict[str, str]:
+    allowed_set = {item.upper() for item in allowed}
+    out: dict[str, str] = {}
+    for k, v in mapping.items():
+        ck = str(k).strip().upper()
+        cv = str(v).strip()
+        if ck in allowed_set and cv:
+            out[ck] = cv
+    return out
+
+
+def _workspace_payload(meta: dict) -> dict:
+    summary = workspace_summary(meta["id"])
+    return {
+        "id": meta["id"],
+        "name": meta.get("name", meta["id"]),
+        "keyword": meta.get("keyword", DEFAULT_KEYWORD),
+        "language": meta.get("language", "tr"),
+        "countries": meta.get("countries", []),
+        "use_topic_mode": bool(meta.get("use_topic_mode", False)),
+        "country_keywords": meta.get("country_keywords", {}),
+        "dataset_rows": int(meta.get("dataset_rows", 0)),
+        "updated_at": meta.get("updated_at", ""),
+        "is_default": meta["id"] == get_default_workspace_id(),
+        "stats": summary,
+    }
+
+
+def _filter_timeline(timeline: pd.DataFrame, date_range: str, start: date | None, end: date | None) -> pd.DataFrame:
+    if timeline.empty:
+        return timeline
+
+    out = timeline.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date"])
+    if out.empty:
+        return out
+
+    max_date = out["date"].max()
+    if date_range == "1m":
+        out = out[out["date"] >= max_date - pd.Timedelta(days=30)]
+    elif date_range == "3m":
+        out = out[out["date"] >= max_date - pd.Timedelta(days=90)]
+    elif date_range == "6m":
+        out = out[out["date"] >= max_date - pd.Timedelta(days=180)]
+    elif date_range == "custom" and start and end:
+        out = out[(out["date"] >= pd.Timestamp(start)) & (out["date"] <= pd.Timestamp(end))]
+
+    return out.sort_values("date").reset_index(drop=True)
+
 
 def _load_geocache() -> pd.DataFrame:
     if GEOCACHE_FILE.exists():
@@ -305,8 +355,13 @@ def _load_geocache() -> pd.DataFrame:
         cache["lat"] = pd.to_numeric(cache["lat"], errors="coerce")
         cache["lon"] = pd.to_numeric(cache["lon"], errors="coerce")
         return cache[["country", "city", "lat", "lon"]]
-    return pd.DataFrame({"country": pd.Series(dtype="string"), "city": pd.Series(dtype="string"),
-                          "lat": pd.Series(dtype="float64"), "lon": pd.Series(dtype="float64")})
+
+    return pd.DataFrame({
+        "country": pd.Series(dtype="string"),
+        "city": pd.Series(dtype="string"),
+        "lat": pd.Series(dtype="float64"),
+        "lon": pd.Series(dtype="float64"),
+    })
 
 
 def _save_geocache(df: pd.DataFrame) -> None:
@@ -323,8 +378,8 @@ def _geocode_cities(df: pd.DataFrame) -> pd.DataFrame:
     if missing.empty:
         return merged
 
-    geolocator = Nominatim(user_agent="trend-marketing-assistant", timeout=8)
-    new_rows = []
+    geolocator = Nominatim(user_agent="b2btrend-fastapi", timeout=8)
+    new_rows: list[dict] = []
     for _, row in missing.iterrows():
         query = f"{row['city']}, {row['country']}"
         lat, lon = None, None
@@ -347,1226 +402,720 @@ def _geocode_cities(df: pd.DataFrame) -> pd.DataFrame:
     return work.merge(cache, on=["country", "city"], how="left")
 
 
-# ── Plotly template ──
-_PLOTLY_TEMPLATE = dict(
-    layout=dict(
-        font=dict(family="Inter, sans-serif"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=20, r=20, t=50, b=20),
-        colorway=["#667eea", "#764ba2", "#f093fb", "#f5576c",
-                   "#4facfe", "#00f2fe", "#43e97b", "#fa709a",
-                   "#fee140", "#30cfd0"],
-        xaxis=dict(gridcolor="#e0e0e022", zerolinecolor="#e0e0e022"),
-        yaxis=dict(gridcolor="#e0e0e022", zerolinecolor="#e0e0e022"),
-        hoverlabel=dict(font_size=12, font_family="Inter"),
-    )
-)
-
-
-def _apply_plotly_style(fig: go.Figure, height: int = 450) -> go.Figure:
-    """Plotly grafiğine modern minimalist stil uygular."""
-    fig.update_layout(
-        height=height,
-        font=dict(family="Inter, sans-serif"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=20, r=20, t=50, b=20),
-        xaxis=dict(gridcolor="rgba(128,128,128,0.1)", zerolinecolor="rgba(128,128,128,0.1)"),
-        yaxis=dict(gridcolor="rgba(128,128,128,0.1)", zerolinecolor="rgba(128,128,128,0.1)"),
-        hoverlabel=dict(font_size=12, font_family="Inter"),
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="right", x=1, font=dict(size=11),
-        ),
-    )
-    return fig
-
-
-# ══════════════════════════════════════════════════════════════
-#  SESSION STATE DEFAULTS
-# ══════════════════════════════════════════════════════════════
-
-if "lang" not in st.session_state:
-    st.session_state["lang"] = "tr"
-if "selected_country" not in st.session_state:
-    st.session_state["selected_country"] = None
-if "workspace_id" not in st.session_state:
-    st.session_state["workspace_id"] = None
-if "show_workspace_page" not in st.session_state:
-    st.session_state["show_workspace_page"] = False
-
-LANG = st.session_state["lang"]
-
-
-def tr(key: str, **kwargs) -> str:
-    return t(LANG, key, **kwargs)
-
-
-def signal_label(signal: dict) -> str:
-    return tr(signal.get("label_key", "trend_no_data"))
-
-
-def strength_label(data: dict) -> str:
-    return tr(data.get("label_key", "strength_no_data"))
-
-
-def decision_action_label(decision: dict) -> str:
-    return tr(decision.get("action_key", "action_keep"))
-
-
-def decision_reason(decision: dict) -> str:
-    return tr(decision.get("reason_key", "reason_keep_stable"))
-
-
-def _country_keywords_to_text(mapping: dict[str, str]) -> str:
-    lines: list[str] = []
-    for country in sorted(mapping.keys()):
-        value = str(mapping[country]).strip()
-        if value:
-            lines.append(f"{country}:{value}")
-    return "\n".join(lines)
-
-
-def _parse_country_keywords_text(raw_text: str, allowed_countries: list[str]) -> dict[str, str]:
-    allowed = {c.upper() for c in allowed_countries}
-    out: dict[str, str] = {}
-    for raw_line in (raw_text or "").splitlines():
-        line = raw_line.strip()
-        if not line or ":" not in line:
-            continue
-        country, value = line.split(":", 1)
-        cc = country.strip().upper()
-        term = value.strip()
-        if cc and term and cc in allowed:
-            out[cc] = term
-    return out
-
-
-def _render_workspace_home() -> None:
-    st.markdown(f"## 📂 {t(LANG, 'app_title')} Workspaces")
-    st.markdown('<p class="ws-grid-note">Karttan secim yapabilir, + ile workspace olusturabilir, ⋯ menusuyle duzenleme/silme/varsayilan islemlerini yonetebilirsin.</p>', unsafe_allow_html=True)
-
-    workspaces = list_workspaces()
-    default_workspace_id = get_default_workspace_id()
-
-    header_col_1, header_col_2 = st.columns([1.5, 1])
-    with header_col_1:
-        create_open = st.button("➕ Yeni Workspace", type="primary", key="ws_create_open")
-    with header_col_2:
-        lang_options = list(SUPPORTED_LANGUAGES.keys())
-        current_lang = st.session_state.get("lang", "tr")
-        lang_idx = lang_options.index(current_lang) if current_lang in lang_options else 0
-        selected_lang = st.selectbox(
-            "Dil",
-            options=lang_options,
-            index=lang_idx,
-            format_func=lambda x: SUPPORTED_LANGUAGES[x],
-            key="workspace_page_lang",
-        )
-        if selected_lang != st.session_state.get("lang"):
-            st.session_state["lang"] = selected_lang
-            st.rerun()
-
-    if create_open:
-        st.session_state["show_create_workspace"] = True
-
-    if st.session_state.get("show_create_workspace", False):
-        with st.expander("Yeni Workspace", expanded=True):
-            new_name = st.text_input("Workspace adi", value="", key="create_ws_name")
-            new_keyword = st.text_input("Arama metni veya Topic ID", value=DEFAULT_KEYWORD, key="create_ws_keyword")
-            new_countries = st.multiselect(
-                "Ulkeler",
-                ALL_COUNTRIES,
-                default=list(TOP_20_COUNTRIES),
-                key="create_ws_countries",
-            )
-            use_topic_mode = st.toggle(
-                "Google Topic ID modu (/m/...)",
-                value=False,
-                key="create_ws_topic_mode",
-                help="Aciksa tek bir Topic ID tum ulkelerde kullanilir. Kapaliysa ulke bazli kelimeler kullanilabilir.",
-            )
-            country_keywords_text = st.text_area(
-                "Ulke bazli anahtar kelimeler (CC:kelime)",
-                value="",
-                key="create_ws_country_keywords",
-                disabled=use_topic_mode,
-                height=120,
-                placeholder="TR:tavuk\nUS:chicken\nDE:hahnchen",
-            )
-
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Workspace Olustur", type="primary", use_container_width=True, key="create_ws_submit"):
-                    created = create_workspace(
-                        name=new_name or "Yeni Workspace",
-                        keyword=new_keyword,
-                        countries=new_countries,
-                    )
-                    keywords_map = _parse_country_keywords_text(country_keywords_text, new_countries or list(TOP_20_COUNTRIES))
-                    update_workspace(
-                        created["id"],
-                        name=new_name or "Yeni Workspace",
-                        language=st.session_state.get("lang", "tr"),
-                        keyword=new_keyword,
-                        countries=new_countries,
-                        use_topic_mode=use_topic_mode,
-                        country_keywords=keywords_map,
-                    )
-                    st.session_state["workspace_id"] = created["id"]
-                    st.session_state["show_create_workspace"] = False
-                    st.success("Workspace olusturuldu.")
-                    st.rerun()
-            with c2:
-                if st.button("Vazgec", use_container_width=True, key="create_ws_cancel"):
-                    st.session_state["show_create_workspace"] = False
-                    st.rerun()
-
-    if not workspaces:
-        st.info("Henuz workspace yok. + butonundan olustur.")
-        return
-
-    for idx, ws in enumerate(workspaces):
-        ws_id = ws["id"]
-        stats = workspace_summary(ws_id)
-        default_badge = "(VARSAYILAN)" if ws_id == default_workspace_id else ""
-
-        col_card, col_menu = st.columns([0.92, 0.08], gap="small")
-        
-        with col_card:
-            if st.button(
-                f"📂 **{ws.get('name', ws_id)}** {default_badge}\n"
-                f"🔍 {ws.get('keyword', DEFAULT_KEYWORD)}\n\n"
-                f"📊 {stats['countries_count']} ülke • {stats['cities_count']} şehir • ⭐ {stats['avg_score']:.1f}",
-                key=f"open_ws_{idx}",
-                use_container_width=True,
-            ):
-                st.session_state["workspace_id"] = ws_id
-                st.rerun()
-        
-        with col_menu:
-            with st.popover("⋯"):
-                if st.button("Varsayilan Yap", key=f"default_ws_{idx}", use_container_width=True):
-                    set_default_workspace(ws_id)
-                    st.success("Varsayilan workspace guncellendi.")
-                    st.rerun()
-
-                with st.expander("Duzenle", expanded=False):
-                    edit_name = st.text_input("Workspace adi", value=str(ws.get("name") or ws_id), key=f"edit_name_{idx}")
-                    edit_lang = st.selectbox(
-                        "Dil",
-                        options=list(SUPPORTED_LANGUAGES.keys()),
-                        index=list(SUPPORTED_LANGUAGES.keys()).index(str(ws.get("language") or "tr")) if str(ws.get("language") or "tr") in SUPPORTED_LANGUAGES else 0,
-                        format_func=lambda x: SUPPORTED_LANGUAGES[x],
-                        key=f"edit_lang_{idx}",
-                    )
-                    edit_keyword = st.text_input(
-                        "Arama metni veya Topic ID",
-                        value=str(ws.get("keyword") or DEFAULT_KEYWORD),
-                        key=f"edit_keyword_{idx}",
-                    )
-                    edit_countries = st.multiselect(
-                        "Ulkeler",
-                        ALL_COUNTRIES,
-                        default=list(ws.get("countries") or TOP_20_COUNTRIES),
-                        key=f"edit_countries_{idx}",
-                    )
-                    edit_topic_mode = st.toggle(
-                        "Google Topic ID modu (/m/...)",
-                        value=bool(ws.get("use_topic_mode", False)),
-                        key=f"edit_topic_mode_{idx}",
-                    )
-                    edit_country_keywords = st.text_area(
-                        "Ulke bazli anahtar kelimeler (CC:kelime)",
-                        value=_country_keywords_to_text(ws.get("country_keywords") or {}),
-                        key=f"edit_country_keywords_{idx}",
-                        disabled=edit_topic_mode,
-                        height=120,
-                    )
-
-                    if st.button("Kaydet", type="primary", key=f"save_ws_{idx}", use_container_width=True):
-                        keywords_map = _parse_country_keywords_text(edit_country_keywords, edit_countries or list(TOP_20_COUNTRIES))
-                        update_workspace(
-                            ws_id,
-                            name=edit_name,
-                            language=edit_lang,
-                            keyword=edit_keyword,
-                            countries=edit_countries,
-                            use_topic_mode=edit_topic_mode,
-                            country_keywords=keywords_map,
-                        )
-                        st.success("Workspace guncellendi.")
-                        st.rerun()
-
-                if st.button("Sil", key=f"delete_ws_{idx}", use_container_width=True):
-                    delete_workspace(ws_id)
-                    if st.session_state.get("workspace_id") == ws_id:
-                        st.session_state["workspace_id"] = None
-                    st.success("Workspace silindi.")
-                    st.rerun()
-
-
-# Ilk giriste zorunlu workspace secim/olusturma/duzenleme ekranı
-all_workspaces = list_workspaces()
-available_ids = [item["id"] for item in all_workspaces]
-if st.session_state["workspace_id"] not in available_ids:
-    st.session_state["workspace_id"] = None
-
-if st.session_state.get("show_workspace_page", False):
-    st.session_state["show_workspace_page"] = False
-    _render_workspace_home()
-    st.stop()
-
-if st.session_state["workspace_id"] is None:
-    default_workspace_id = get_default_workspace_id()
-    if default_workspace_id and default_workspace_id in available_ids:
-        st.session_state["workspace_id"] = default_workspace_id
-
-if st.session_state["workspace_id"] is None:
-    _render_workspace_home()
-    st.stop()
-
-active_workspace_id = st.session_state["workspace_id"]
-active_workspace_meta = load_workspace_meta(active_workspace_id)
-
-workspace_lang = str(active_workspace_meta.get("language") or "tr")
-if workspace_lang not in SUPPORTED_LANGUAGES:
-    workspace_lang = "tr"
-if st.session_state.get("lang") != workspace_lang:
-    st.session_state["lang"] = workspace_lang
-LANG = workspace_lang
-
-hl_map = {
-    "tr": "tr-TR", "en": "en-US", "de": "de-DE", "fr": "fr-FR",
-    "es": "es-ES", "pt": "pt-BR", "ar": "ar-SA", "zh": "zh-CN",
-    "ja": "ja-JP", "ko": "ko-KR", "ru": "ru-RU", "it": "it-IT",
-}
-
-
-# ══════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════════
-
-with st.sidebar:
-    st.markdown(f"### 📊 {tr('sidebar_title')}")
-    st.caption(tr("sidebar_caption"))
-
-    st.divider()
-
-    workspace_items = list_workspaces()
-    workspace_ids = [item["id"] for item in workspace_items]
-    current_idx = workspace_ids.index(active_workspace_id) if active_workspace_id in workspace_ids else 0
-    selected_workspace_id = st.selectbox(
-        "🗂️ Workspace",
-        options=workspace_ids,
-        format_func=lambda ws_id: _workspace_label(next(item for item in workspace_items if item["id"] == ws_id)),
-        index=current_idx,
-        key="sidebar_workspace_select",
-    )
-    if selected_workspace_id != active_workspace_id:
-        st.session_state["workspace_id"] = selected_workspace_id
-        st.rerun()
-
-    st.caption("Workspace yonetimi icin ilk ekrana donebilirsiniz.")
-    if st.button("Workspace Sayfasina Don", use_container_width=True, key="goto_workspace_home"):
-        st.session_state["show_workspace_page"] = True
-        st.rerun()
-
-    active_workspace_meta = load_workspace_meta(active_workspace_id)
-
-    # ── Veri Çekimi ──
-    st.markdown(f"**📥 {t(LANG, 'data_section')}**")
-    st.caption(str(active_workspace_meta.get("name") or active_workspace_id))
-    st.caption(f"🔍 {str(active_workspace_meta.get('keyword') or DEFAULT_KEYWORD)}")
-    col_f1, col_f2 = st.columns(2)
-    with col_f1:
-        fetch_btn = st.button(f"📥 {t(LANG, 'fetch_data')}", type="primary", use_container_width=True)
-    with col_f2:
-        if st.button(f"🗑️ {t(LANG, 'clear_cache')}", use_container_width=True):
-            n = clear_cache()
-            st.success(f"✅ {tr('cache_cleared', count=n)}")
-
-    if fetch_btn:
-        with st.spinner(t(LANG, "loading")):
-            kw = str(active_workspace_meta.get("keyword") or DEFAULT_KEYWORD).strip() or DEFAULT_KEYWORD
-            effective_countries = list(active_workspace_meta.get("countries") or TOP_20_COUNTRIES)
-            use_topic_mode = bool(active_workspace_meta.get("use_topic_mode", False))
-            country_keywords = active_workspace_meta.get("country_keywords") or {}
-            cfg = FetchConfig(
-                keyword=kw,
-                top_cities_per_country=10,
-                hl=hl_map.get(LANG, "en-US"),
-            )
-
-            if use_topic_mode:
-                cities_new, timeline_new = fetch_trends_dataset(countries=effective_countries, config=cfg)
-            else:
-                cities_new, timeline_new = fetch_trends_dataset_country_keywords(
-                    countries=effective_countries,
-                    keyword_by_country=country_keywords,
-                    default_keyword=kw,
-                    config=cfg,
-                )
-
-            if cities_new.empty or timeline_new.empty:
-                st.error(t(LANG, "no_data"))
-            else:
-                save_workspace_dataset(active_workspace_id, cities_new, timeline_new)
-                st.success(f"✅ {tr('data_updated')}")
-                st.rerun()
-
-    st.divider()
-
-    # ── Tarih Filtresi ──
-    st.markdown(f"**📅 {t(LANG, 'date_filter')}**")
-    date_options = [t(LANG, "all"), t(LANG, "last_1m"), t(LANG, "last_3m"),
-                    t(LANG, "last_6m"), t(LANG, "custom_range")]
-    date_range_option = st.selectbox(
-        t(LANG, "date_filter"), date_options, index=0, key="date_range",
-        label_visibility="collapsed",
-    )
-    custom_start, custom_end = None, None
-    if date_range_option == t(LANG, "custom_range"):
-        custom_start = st.date_input(t(LANG, "start_date"), key="date_start")
-        custom_end = st.date_input(t(LANG, "end_date"), key="date_end")
-
-    st.divider()
-    st.caption("v3.0 — B2BTrend Suite")
-
-
-# ══════════════════════════════════════════════════════════════
-#  VERİ YÜKLEME
-# ══════════════════════════════════════════════════════════════
-
-cities, timeline = load_workspace_dataset(active_workspace_id)
-
-if cities.empty or timeline.empty:
-    # Göster: arama ekranı
-    st.markdown(f"""
-    <div class="search-container">
-        <div class="search-title">📊 {t(LANG, 'app_title')}</div>
-        <p style="opacity:0.7;">{t(LANG, 'no_data')}</p>
-    </div>
-    """, unsafe_allow_html=True)
-    st.info(f"👈 {t(LANG, 'no_data')}")
-    st.stop()
-
-# ── Tarih filtresi ──
-if date_range_option == t(LANG, "last_1m"):
-    cutoff = timeline["date"].max() - pd.Timedelta(days=30)
-    timeline = timeline[timeline["date"] >= cutoff]
-elif date_range_option == t(LANG, "last_3m"):
-    cutoff = timeline["date"].max() - pd.Timedelta(days=90)
-    timeline = timeline[timeline["date"] >= cutoff]
-elif date_range_option == t(LANG, "last_6m"):
-    cutoff = timeline["date"].max() - pd.Timedelta(days=180)
-    timeline = timeline[timeline["date"] >= cutoff]
-elif date_range_option == t(LANG, "custom_range") and custom_start and custom_end:
-    timeline = timeline[
-        (timeline["date"] >= pd.Timestamp(custom_start))
-        & (timeline["date"] <= pd.Timestamp(custom_end))
-    ]
-
-kw_display = str(active_workspace_meta.get("keyword") or DEFAULT_KEYWORD)
-
-
-# ══════════════════════════════════════════════════════════════
-#  HEADER — Arama Bölümü
-# ══════════════════════════════════════════════════════════════
-
-st.markdown(f"""
-<div class="search-container">
-    <div class="search-title">📊 {t(LANG, 'app_title')}</div>
-    <p style="opacity:0.6; margin:0; font-size:0.9rem;">
-        🔍 <strong>{kw_display}</strong> &nbsp;·&nbsp;
-        📆 {timeline['date'].min().strftime('%Y-%m-%d')} → {timeline['date'].max().strftime('%Y-%m-%d')} &nbsp;·&nbsp;
-        🌍 {cities['country'].nunique()} {t(LANG, 'total_countries')} &nbsp;·&nbsp;
-        🏙️ {cities['city'].nunique()} {t(LANG, 'total_cities')}
-    </p>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════
-#  ÜST METRİKLER
-# ══════════════════════════════════════════════════════════════
-
-country_summary = timeline[timeline["city"].fillna("") == ""].groupby("country", as_index=False)
-country_summary = country_summary.agg(avg_score=("score", "mean"), latest_date=("date", "max")).sort_values("avg_score", ascending=False)
-if country_summary.empty:
-    # Yedek: şehir bazlı toplanmış veri varsa, yine de devam edelim.
+def _get_workspace_data(workspace_id: str, date_range: str, start: date | None, end: date | None) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    meta = load_workspace_meta(workspace_id)
+    cities, timeline = load_workspace_dataset(workspace_id)
+    if not timeline.empty:
+        timeline = _filter_timeline(timeline, date_range, start, end)
+    return meta, cities, timeline
+
+
+def _country_summary(timeline: pd.DataFrame) -> pd.DataFrame:
     country_summary = (
-        timeline.groupby("country", as_index=False)
-        .agg(avg_score=("score", "mean"), latest_date=("date", "max"))
+        timeline[timeline["city"].fillna("") == ""]
+        .groupby("country", as_index=False)
+        .agg(avg_score=("score", "mean"))
         .sort_values("avg_score", ascending=False)
     )
-country_summary["iso3"] = country_summary["country"].apply(_country_iso3)
-country_summary["country_name"] = country_summary["country"].apply(_country_name)
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric(f"🌍 {t(LANG, 'total_countries')}", country_summary.shape[0])
-m2.metric(f"🏙️ {t(LANG, 'total_cities')}", cities.shape[0])
-m3.metric(f"📊 {t(LANG, 'avg_score')}", f"{country_summary['avg_score'].mean():.1f}")
-best_row = country_summary.iloc[0] if not country_summary.empty else None
-if best_row is not None:
-    m4.metric(f"📈 {t(LANG, 'highest')}", f"{best_row['avg_score']:.1f} ({best_row['country']})")
-
-st.divider()
+    if country_summary.empty:
+        country_summary = (
+            timeline.groupby("country", as_index=False)
+            .agg(avg_score=("score", "mean"))
+            .sort_values("avg_score", ascending=False)
+        )
+    country_summary["iso3"] = country_summary["country"].map(_country_iso3)
+    country_summary["country_name"] = country_summary["country"].map(_country_name)
+    return country_summary
 
 
-# ══════════════════════════════════════════════════════════════
-#  TAB YAPISI
-# ══════════════════════════════════════════════════════════════
-
-tab_map, tab_ts, tab_city, tab_hourly, tab_rank, tab_data = st.tabs([
-    f"🌍 {t(LANG, 'world_map')}",
-    f"📈 {t(LANG, 'time_series')}",
-    f"🏙️ {t(LANG, 'city_drilldown')}",
-    f"⏰ {t(LANG, 'hourly')}",
-    f"🏆 {t(LANG, 'ranking')}",
-    f"📋 {t(LANG, 'raw_data')}",
-])
-
-country_list = country_summary["country"].tolist()
+def _empty_dashboard(meta: dict, message: str) -> dict:
+    return {
+        "workspace": _workspace_payload(meta),
+        "has_data": False,
+        "message": message,
+    }
 
 
-# ══════════════════════════════════════════════════════════════
-#  TAB 1: İNTERAKTİF DÜNYA HARİTASI + DRILL-DOWN
-# ══════════════════════════════════════════════════════════════
+def _render_world_charts(country_summary: pd.DataFrame, cities: pd.DataFrame, selected_country: str) -> dict:
+    fig_world = px.choropleth(
+        country_summary,
+        locations="iso3",
+        color="avg_score",
+        hover_name="country_name",
+        hover_data={"avg_score": ":.1f", "iso3": False},
+        projection="natural earth",
+        color_continuous_scale="YlOrRd",
+    )
+    fig_world.update_layout(height=520, margin=dict(l=0, r=0, t=8, b=0), paper_bgcolor="rgba(0,0,0,0)")
 
-with tab_map:
-    st.subheader(f"🌍 {t(LANG, 'world_map')}")
-    st.caption(t(LANG, "select_on_map"))
+    city_map_data = cities[cities["country"] == selected_country].sort_values("score", ascending=False)
+    fig_drill = go.Figure()
+    if not city_map_data.empty:
+        points = _geocode_cities(city_map_data)
+        points = points.merge(city_map_data[["country", "city", "score"]], on=["country", "city"], how="left").dropna(subset=["lat", "lon"])
+        if not points.empty:
+            fig_drill = px.scatter_map(
+                points,
+                lat="lat",
+                lon="lon",
+                color="score",
+                size="score",
+                size_max=25,
+                hover_name="city",
+                hover_data={"score": True, "lat": False, "lon": False},
+                zoom=4,
+                map_style="carto-positron",
+                color_continuous_scale="Viridis",
+            )
+            fig_drill.update_traces(marker={"opacity": 0.9})
+            fig_drill.update_layout(height=520, margin=dict(l=0, r=0, t=8, b=0))
 
-    # Tek bir harita: choropleth + scatter combo
-    # Ülke seçme dropdown — haritadaki ülkeye tıklamayı simüle eder
-    map_mode = st.radio(
-        "Mod", [t(LANG, "overview"), t(LANG, "city_drilldown")],
-        horizontal=True, key="map_mode", label_visibility="collapsed",
+    city_world = go.Figure()
+    city_map_all = cities.sort_values("score", ascending=False).head(250).copy()
+    if not city_map_all.empty:
+        points_all = _geocode_cities(city_map_all)
+        points_all = points_all.merge(city_map_all[["country", "city", "score"]], on=["country", "city"], how="left").dropna(subset=["lat", "lon"])
+        if not points_all.empty:
+            city_world = px.scatter_map(
+                points_all,
+                lat="lat",
+                lon="lon",
+                color="score",
+                size="score",
+                size_max=18,
+                hover_name="city",
+                hover_data={"country": True, "score": True, "lat": False, "lon": False},
+                zoom=1.2,
+                map_style="carto-positron",
+                color_continuous_scale="Plasma",
+            )
+            city_world.update_layout(height=580, margin=dict(l=0, r=0, t=8, b=0))
+
+    return {
+        "world": _fig_to_dict(fig_world),
+        "drill_city": _fig_to_dict(fig_drill),
+        "world_city": _fig_to_dict(city_world),
+        "drill_table": city_map_data[["city", "score", "geo_code"]].head(40).to_dict(orient="records"),
+    }
+
+
+def _render_country_analysis(timeline: pd.DataFrame, country_code: str) -> dict:
+    country_tl = timeline[(timeline["country"] == country_code) & (timeline["city"].fillna("") == "")].copy()
+    if country_tl.empty:
+        country_tl = timeline[timeline["country"] == country_code].copy()
+    country_agg = country_tl.groupby("date", as_index=False).agg(score=("score", "mean")).sort_values("date")
+
+    mas = compute_moving_averages(country_agg["score"])
+    scores = compute_trend_scores(country_agg["score"])
+    signal = robust_trend_signal(country_agg["score"])
+    strength = trend_strength_meter(country_agg["score"])
+
+    fig_ts = go.Figure()
+    fig_ts.add_trace(go.Scatter(x=country_agg["date"], y=country_agg["score"], mode="lines", name="Raw", opacity=0.35, line=dict(color="#94a3b8", width=1)))
+    fig_ts.add_trace(go.Scatter(x=country_agg["date"], y=mas["ma7"], mode="lines", name="MA7", line=dict(color="#0f766e", width=2.4)))
+    fig_ts.add_trace(go.Scatter(x=country_agg["date"], y=mas["ma30"], mode="lines", name="MA30", line=dict(color="#ea580c", width=2, dash="dash")))
+
+    spikes = detect_spikes(country_agg["score"], z_threshold=2.0)
+    if not spikes.empty:
+        spike_rows = spikes[spikes["is_spike"]]
+        if not spike_rows.empty:
+            peak_dates = country_agg.loc[spike_rows["index"], "date"]
+            peak_scores = country_agg.loc[spike_rows["index"], "score"]
+            fig_ts.add_trace(go.Scatter(x=peak_dates, y=peak_scores, mode="markers", name="Spike", marker=dict(color="#dc2626", size=9, symbol="diamond")))
+
+    fig_ts.update_layout(height=430, margin=dict(l=20, r=20, t=45, b=22), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hovermode="x unified")
+
+    decomp = stl_decompose(country_agg["score"])
+    fig_stl = go.Figure()
+    if decomp is not None:
+        fig_stl = make_subplots(rows=4, cols=1, shared_xaxes=True, subplot_titles=["Observed", "Trend", "Seasonal", "Residual"], vertical_spacing=0.05)
+        dates = country_agg["date"]
+        fig_stl.add_trace(go.Scatter(x=dates, y=decomp["observed"], mode="lines", line=dict(color="#0f766e")), row=1, col=1)
+        fig_stl.add_trace(go.Scatter(x=dates, y=decomp["trend"], mode="lines", line=dict(color="#f97316")), row=2, col=1)
+        fig_stl.add_trace(go.Scatter(x=dates, y=decomp["seasonal"], mode="lines", line=dict(color="#22c55e")), row=3, col=1)
+        fig_stl.add_trace(go.Scatter(x=dates, y=decomp["residual"], mode="lines+markers", marker=dict(size=3), line=dict(color="#7c3aed")), row=4, col=1)
+        fig_stl.update_layout(height=660, margin=dict(l=20, r=20, t=50, b=24), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+
+    change_pts = detect_change_points(country_agg["score"], threshold=2.0)
+    extrema = detect_local_extrema(country_agg["score"], order=3)
+
+    fig_cp = go.Figure()
+    fig_cp.add_trace(go.Scatter(x=country_agg["date"], y=country_agg["score"], mode="lines", line=dict(color="#0f766e", width=2), name="Score"))
+    if change_pts:
+        cp_dates = [country_agg["date"].iloc[i] for i in change_pts if i < len(country_agg)]
+        cp_scores = [country_agg["score"].iloc[i] for i in change_pts if i < len(country_agg)]
+        fig_cp.add_trace(go.Scatter(x=cp_dates, y=cp_scores, mode="markers", name="Change", marker=dict(color="#ef4444", size=12, symbol="x")))
+    for idx in extrema.get("maxima", []):
+        if idx < len(country_agg):
+            fig_cp.add_trace(go.Scatter(x=[country_agg["date"].iloc[idx]], y=[country_agg["score"].iloc[idx]], mode="markers", marker=dict(color="#22c55e", size=8), name="Peak", showlegend=False))
+    for idx in extrema.get("minima", []):
+        if idx < len(country_agg):
+            fig_cp.add_trace(go.Scatter(x=[country_agg["date"].iloc[idx]], y=[country_agg["score"].iloc[idx]], mode="markers", marker=dict(color="#a855f7", size=8), name="Valley", showlegend=False))
+    fig_cp.update_layout(height=420, margin=dict(l=20, r=20, t=45, b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+
+    vol_df = rolling_volatility(country_agg["score"], window=7)
+    fig_vol = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=["Bollinger", "Volatility %"], row_heights=[0.65, 0.35], vertical_spacing=0.08)
+    fig_vol.add_trace(go.Scatter(x=country_agg["date"], y=vol_df["upper_band"], mode="lines", line=dict(width=0), showlegend=False), row=1, col=1)
+    fig_vol.add_trace(go.Scatter(x=country_agg["date"], y=vol_df["lower_band"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(15,118,110,0.10)", name="Band"), row=1, col=1)
+    fig_vol.add_trace(go.Scatter(x=country_agg["date"], y=vol_df["ma"], mode="lines", line=dict(color="#0f766e", width=2), name="MA"), row=1, col=1)
+    fig_vol.add_trace(go.Scatter(x=country_agg["date"], y=vol_df["value"], mode="lines", line=dict(color="#334155", width=1), name="Score"), row=1, col=1)
+    fig_vol.add_trace(go.Bar(x=country_agg["date"], y=vol_df["volatility_pct"], marker=dict(color=vol_df["volatility_pct"], colorscale="YlOrRd", showscale=False), name="Vol%"), row=2, col=1)
+    fig_vol.update_layout(height=560, margin=dict(l=20, r=20, t=46, b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+
+    forecast_df = advanced_forecast(country_agg["score"], periods=12)
+    fig_fc = go.Figure()
+    if not forecast_df.empty:
+        fig_fc.add_trace(go.Scatter(x=country_agg["date"], y=country_agg["score"], mode="lines", line=dict(color="#0f766e", width=2), name="History"))
+        fig_fc.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat_upper"], mode="lines", line=dict(width=0), showlegend=False))
+        fig_fc.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat_lower"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(249,115,22,0.12)", name="95% CI"))
+        fig_fc.add_trace(go.Scatter(x=forecast_df["ds"], y=forecast_df["yhat"], mode="lines", line=dict(color="#f97316", width=2.3, dash="dash"), name="Forecast"))
+    fig_fc.update_layout(height=420, margin=dict(l=20, r=20, t=45, b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+
+    corr_matrix = compute_correlation_matrix(timeline[timeline["city"].fillna("") == ""] if not timeline.empty else timeline, group_col="country")
+    fig_corr = go.Figure()
+    if not corr_matrix.empty and corr_matrix.shape[0] > 1:
+        fig_corr = px.imshow(corr_matrix, color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+        fig_corr.update_layout(height=500, margin=dict(l=20, r=20, t=45, b=20))
+
+    return {
+        "country": country_code,
+        "country_name": _country_name(country_code),
+        "stats": {
+            "signal": signal,
+            "scores": scores,
+            "strength": strength,
+            "change_points_count": len(change_pts),
+        },
+        "charts": {
+            "overview": _fig_to_dict(fig_ts),
+            "stl": _fig_to_dict(fig_stl),
+            "change_points": _fig_to_dict(fig_cp),
+            "volatility": _fig_to_dict(fig_vol),
+            "forecast": _fig_to_dict(fig_fc),
+            "correlation": _fig_to_dict(fig_corr),
+        },
+        "tables": {
+            "forecast": forecast_df.to_dict(orient="records") if not forecast_df.empty else [],
+            "spikes": spikes[spikes["is_spike"]].to_dict(orient="records") if not spikes.empty else [],
+        },
+    }
+
+
+def _render_city_analysis(timeline: pd.DataFrame, cities: pd.DataFrame, country_code: str, city_name: str | None) -> dict:
+    country_cities_df = cities[cities["country"] == country_code].sort_values("score", ascending=False)
+    ranked = location_trend_ranking(country_cities_df)
+    city_names = sorted([c for c in timeline[timeline["country"] == country_code]["city"].dropna().unique().tolist() if str(c).strip()])
+
+    if not city_names:
+        return {
+            "country": country_code,
+            "city": None,
+            "city_options": [],
+            "ranking": ranked[["rank", "city", "score", "geo_code"]].head(30).to_dict(orient="records") if not ranked.empty else [],
+            "message": "No city timeline data",
+            "charts": {},
+            "stats": {},
+        }
+
+    selected_city = city_name if city_name in city_names else city_names[0]
+    city_ts = (
+        timeline[(timeline["country"] == country_code) & (timeline["city"] == selected_city)][["date", "score"]]
+        .sort_values("date")
+        .reset_index(drop=True)
     )
 
-    if map_mode == t(LANG, "overview"):
-        # Dünya choropleth haritası
-        fig_world = px.choropleth(
-            country_summary,
-            locations="iso3",
-            color="avg_score",
-            hover_name="country_name",
-            hover_data={"avg_score": ":.1f", "iso3": False},
-            labels={"avg_score": t(LANG, "avg_score")},
-            projection="natural earth",
-            color_continuous_scale="YlOrRd",
+    city_ts["score_clean"], outlier_count = clean_city_outliers(city_ts["score"]) if not city_ts.empty else (pd.Series(dtype=float), 0)
+    city_signal = robust_trend_signal(city_ts["score_clean"]) if not city_ts.empty else {"direction": "flat", "label": "No data", "slope": 0, "volatility": 0}
+    city_scores = compute_trend_scores(city_ts["score_clean"]) if not city_ts.empty else {"growth_rate": 0}
+    city_mas = compute_moving_averages(city_ts["score_clean"]) if not city_ts.empty else {"ma7": pd.Series(dtype=float)}
+    city_strength = trend_strength_meter(city_ts["score_clean"]) if not city_ts.empty else {"score": 0, "label": "No data"}
+
+    fig_city = go.Figure()
+    if not city_ts.empty:
+        fig_city.add_trace(go.Scatter(x=city_ts["date"], y=city_ts["score"], mode="lines", name="Raw", opacity=0.3, line=dict(color="#94a3b8", width=1)))
+        fig_city.add_trace(go.Scatter(x=city_ts["date"], y=city_ts["score_clean"], mode="lines", name="Clean", line=dict(color="#0f766e", width=2), fill="tozeroy", fillcolor="rgba(15,118,110,0.08)"))
+        fig_city.add_trace(go.Scatter(x=city_ts["date"], y=city_mas["ma7"], mode="lines", name="MA7", line=dict(color="#f97316", width=1.5, dash="dot")))
+
+    city_forecast = advanced_forecast(city_ts["score_clean"], periods=12) if not city_ts.empty else pd.DataFrame()
+    if not city_forecast.empty:
+        fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat_upper"], mode="lines", line=dict(width=0), showlegend=False))
+        fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat_lower"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(249,115,22,0.1)", name="95% CI"))
+        fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat"], mode="lines", name="Forecast", line=dict(color="#f97316", width=2, dash="dash")))
+
+    fig_city.update_layout(height=430, margin=dict(l=20, r=20, t=45, b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hovermode="x unified")
+
+    return {
+        "country": country_code,
+        "city": selected_city,
+        "city_options": city_names,
+        "ranking": ranked[["rank", "city", "score", "geo_code"]].head(30).to_dict(orient="records") if not ranked.empty else [],
+        "stats": {
+            "signal": city_signal,
+            "scores": city_scores,
+            "strength": city_strength,
+            "outliers_removed": int(outlier_count),
+            "recommendation": recommendation_from_signal(city_signal, lang="tr"),
+        },
+        "charts": {
+            "city_trend": _fig_to_dict(fig_city),
+        },
+        "tables": {
+            "forecast": city_forecast.to_dict(orient="records") if not city_forecast.empty else [],
+        },
+    }
+
+
+def _render_hourly(keyword: str, country_code: str) -> dict:
+    cfg = FetchConfig(keyword=keyword, hl="tr-TR")
+    try:
+        hourly_df = fetch_hourly_data(country_code, config=cfg)
+    except Exception:
+        return {"has_data": False, "message": "No hourly data"}
+
+    if hourly_df.empty:
+        return {"has_data": False, "message": "No hourly data"}
+
+    analysis = hourly_analysis(hourly_df, lang="tr")
+
+    fig_hourly = go.Figure()
+    if not analysis["avg_by_hour"].empty:
+        fig_hourly = px.bar(
+            x=analysis["avg_by_hour"].index,
+            y=analysis["avg_by_hour"].values,
+            labels={"x": "Hour", "y": "Avg Score"},
+            color=analysis["avg_by_hour"].values,
+            color_continuous_scale="Viridis",
         )
-        fig_world.update_layout(
-            height=550,
-            margin=dict(l=0, r=0, t=10, b=0),
-            geo=dict(
-                showframe=False,
-                showcoastlines=True,
-                coastlinecolor="rgba(128,128,128,0.3)",
-                showland=True,
-                landcolor="rgba(240,240,240,0.3)",
-                showocean=True,
-                oceancolor="rgba(200,220,255,0.1)",
-                showlakes=False,
-                projection_type="natural earth",
-            ),
-            coloraxis_colorbar=dict(
-                title=t(LANG, "avg_score"),
-                thickness=15,
-                len=0.5,
-            ),
+        fig_hourly.update_layout(height=380, margin=dict(l=20, r=20, t=42, b=20), coloraxis_showscale=False)
+
+    fig_heatmap = go.Figure()
+    if not analysis["heatmap_matrix"].empty:
+        fig_heatmap = px.imshow(
+            analysis["heatmap_matrix"],
+            labels=dict(x="Hour", y="Day", color="Score"),
+            color_continuous_scale="Viridis",
+            aspect="auto",
         )
-        st.plotly_chart(fig_world, use_container_width=True)
-
-        # Ülke seçimi — dropdown ile (haritadan seçim simülasyonu)
-        st.markdown(f"**{t(LANG, 'drill_down')}:**")
-        selected_for_drill = st.selectbox(
-            t(LANG, "choose_country"),
-            ["---"] + [f"{c} — {_country_name(c)}" for c in country_list],
-            index=0, key="drill_country",
-            label_visibility="collapsed",
-        )
-
-        if selected_for_drill != "---":
-            drill_country = selected_for_drill.split(" — ")[0]
-            st.session_state["selected_country"] = drill_country
-
-            # Şehir scatter haritası
-            city_map_data = cities[cities["country"] == drill_country].sort_values("score", ascending=False)
-            if city_map_data.empty:
-                st.warning(t(LANG, "no_data"))
-            else:
-                city_points = _geocode_cities(city_map_data)
-                city_points = city_points.merge(
-                    city_map_data[["country", "city", "score"]],
-                    on=["country", "city"], how="left",
-                ).dropna(subset=["lat", "lon"])
-
-                if not city_points.empty:
-                    fig_drill = px.scatter_map(
-                        city_points,
-                        lat="lat", lon="lon",
-                        color="score",
-                        size="score",
-                        size_max=25,
-                        hover_name="city",
-                        hover_data={"score": True, "lat": False, "lon": False},
-                        zoom=4,
-                        map_style="carto-positron",
-                        color_continuous_scale="Viridis",
-                    )
-                    fig_drill.update_traces(marker={"opacity": 0.9})
-                    fig_drill.update_layout(
-                        height=500,
-                        margin=dict(l=0, r=0, t=10, b=0),
-                        coloraxis_colorbar=dict(title="Skor", thickness=12),
-                    )
-                    st.plotly_chart(fig_drill, use_container_width=True)
-                    # Bir satır boşluk
-                    st.markdown("<br><br>", unsafe_allow_html=True)
-                    # Şehir tablosu — kompakt
-                    with st.expander(f"📋 {_country_name(drill_country)} — {t(LANG, 'total_cities')}: {len(city_map_data)}"):
-                        st.dataframe(
-                            city_map_data[["city", "score", "geo_code"]].reset_index(drop=True),
-                            use_container_width=True, hide_index=True,
-                        )
-    else:
-        # Doğrudan şehir haritası (tüm dünya)
-        city_map_all = cities.sort_values("score", ascending=False).head(200).copy()
-        if not city_map_all.empty:
-            city_pts = _geocode_cities(city_map_all)
-            city_pts = city_pts.merge(
-                city_map_all[["country", "city", "score"]],
-                on=["country", "city"], how="left",
-            ).dropna(subset=["lat", "lon"])
-
-            if not city_pts.empty:
-                fig_all_cities = px.scatter_map(
-                    city_pts,
-                    lat="lat", lon="lon",
-                    color="score",
-                    size="score",
-                    size_max=20,
-                    hover_name="city",
-                    hover_data={"country": True, "score": True, "lat": False, "lon": False},
-                    zoom=1.5,
-                    map_style="carto-positron",
-                    color_continuous_scale="Plasma",
-                )
-                fig_all_cities.update_layout(
-                    height=600,
-                    margin=dict(l=0, r=0, t=10, b=0),
-                )
-                st.plotly_chart(fig_all_cities, use_container_width=True)
-
-
-# ══════════════════════════════════════════════════════════════
-#  TAB 2: İLERİ ZAMAN SERİSİ ANALİZİ
-# ══════════════════════════════════════════════════════════════
-
-with tab_ts:
-    st.subheader(f"📈 {t(LANG, 'time_series')}")
-
-    sel_country = st.selectbox(t(LANG, "choose_country"), country_list, index=0, key="ts_country")
-    country_tl = timeline[(timeline["country"] == sel_country) & (timeline["city"].fillna("") == "")].copy()
-    if country_tl.empty:
-        # Ülke seviyesinde veri yoksa şehir bazlı ortalamayı kullan
-        country_tl = timeline[timeline["country"] == sel_country].copy()
-
-    if country_tl.empty:
-        st.warning(t(LANG, "no_data"))
-    else:
-        country_agg = (
-            country_tl.groupby("date", as_index=False)
-            .agg(score=("score", "mean"))
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
-
-        # ── Üst metrikler ──
-        mas = compute_moving_averages(country_agg["score"])
-        scores = compute_trend_scores(country_agg["score"])
-        signal = robust_trend_signal(country_agg["score"])
-        strength = trend_strength_meter(country_agg["score"])
-
-        mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric(t(LANG, "trend"), signal_label(signal))
-        mc2.metric("7d Avg", f"{scores['avg_7d']:.1f}")
-        mc3.metric("30d Avg", f"{scores['avg_30d']:.1f}")
-        mc4.metric(t(LANG, "growth"), f"{scores['growth_rate']:+.1f}%")
-        mc5.metric(t(LANG, "trend_strength_meter"), f"{strength['score']:.0f}/100 - {strength_label(strength)}")
-
-        # ── Alt tab'lar ──
-        ts_sub1, ts_sub2, ts_sub3, ts_sub4, ts_sub5 = st.tabs([
-            f"📈 {t(LANG, 'overview')}",
-            f"🔬 {t(LANG, 'stl_decomposition')}",
-            f"📍 {t(LANG, 'change_points')}",
-            f"📊 {t(LANG, 'rolling_volatility')}",
-            f"🔮 {t(LANG, 'ensemble_forecast')}",
-        ])
-
-        # ── Alt Tab 1: Overview ──
-        with ts_sub1:
-            fig_ts = go.Figure()
-            fig_ts.add_trace(go.Scatter(
-                x=country_agg["date"], y=country_agg["score"],
-                mode="lines", name="Ham Skor", opacity=0.4,
-                line=dict(color="#bdc3c7", width=1),
-                fill="tozeroy", fillcolor="rgba(102,126,234,0.05)",
-            ))
-            fig_ts.add_trace(go.Scatter(
-                x=country_agg["date"], y=mas["ma7"],
-                mode="lines", name="7d MA",
-                line=dict(color="#667eea", width=2.5),
-            ))
-            fig_ts.add_trace(go.Scatter(
-                x=country_agg["date"], y=mas["ma30"],
-                mode="lines", name="30d MA",
-                line=dict(color="#f5576c", width=2, dash="dash"),
-            ))
-
-            # Spike noktaları
-            if len(country_agg) > 5:
-                spike_df = detect_spikes(country_agg["score"], z_threshold=2.0)
-                peak_mask = spike_df["is_spike"]
-                if peak_mask.any():
-                    peak_dates = country_agg.loc[spike_df[peak_mask]["index"], "date"]
-                    peak_scores = country_agg.loc[spike_df[peak_mask]["index"], "score"]
-                    fig_ts.add_trace(go.Scatter(
-                        x=peak_dates, y=peak_scores,
-                        mode="markers", name="Anomali",
-                        marker=dict(color="#f5576c", size=10, symbol="diamond",
-                                    line=dict(width=2, color="white")),
-                    ))
-
-            fig_ts = _apply_plotly_style(fig_ts, 420)
-            fig_ts.update_layout(
-                title=f"{_country_name(sel_country)} — Trend",
-                xaxis_title="", yaxis_title="Skor (0-100)",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_ts, use_container_width=True)
-
-        # ── Alt Tab 2: STL Decomposition ──
-        with ts_sub2:
-            decomp = stl_decompose(country_agg["score"])
-            if decomp is not None:
-                fig_stl = make_subplots(
-                    rows=4, cols=1, shared_xaxes=True,
-                    subplot_titles=["Observed", "Trend", "Seasonal", "Residual"],
-                    vertical_spacing=0.06,
-                )
-
-                dates = country_agg["date"]
-                fig_stl.add_trace(go.Scatter(
-                    x=dates, y=decomp["observed"],
-                    mode="lines", name="Observed",
-                    line=dict(color="#667eea", width=1.5),
-                ), row=1, col=1)
-                fig_stl.add_trace(go.Scatter(
-                    x=dates, y=decomp["trend"],
-                    mode="lines", name="Trend",
-                    line=dict(color="#f5576c", width=2),
-                ), row=2, col=1)
-                fig_stl.add_trace(go.Scatter(
-                    x=dates, y=decomp["seasonal"],
-                    mode="lines", name="Seasonal",
-                    line=dict(color="#43e97b", width=1.5),
-                    fill="tozeroy", fillcolor="rgba(67,233,123,0.1)",
-                ), row=3, col=1)
-                fig_stl.add_trace(go.Scatter(
-                    x=dates, y=decomp["residual"],
-                    mode="markers+lines", name="Residual",
-                    line=dict(color="#fa709a", width=1),
-                    marker=dict(size=3),
-                ), row=4, col=1)
-
-                fig_stl = _apply_plotly_style(fig_stl, 650)
-                fig_stl.update_layout(
-                    title=f"STL Decomposition (period={decomp['period']})",
-                    showlegend=False,
-                )
-                st.plotly_chart(fig_stl, use_container_width=True)
-
-                st.info(f"🔬 {tr('seasonal_period_info', period=decomp['period'])}")
-            else:
-                st.warning(tr("stl_insufficient_data"))
-
-        # ── Alt Tab 3: Change Point Detection ──
-        with ts_sub3:
-            change_pts = detect_change_points(country_agg["score"], threshold=2.0)
-            extrema = detect_local_extrema(country_agg["score"], order=3)
-
-            fig_cp = go.Figure()
-            fig_cp.add_trace(go.Scatter(
-                x=country_agg["date"], y=country_agg["score"],
-                mode="lines", name="Score",
-                line=dict(color="#667eea", width=2),
-            ))
-
-            # Change points
-            if change_pts:
-                cp_dates = [country_agg["date"].iloc[i] for i in change_pts if i < len(country_agg)]
-                cp_scores = [country_agg["score"].iloc[i] for i in change_pts if i < len(country_agg)]
-                fig_cp.add_trace(go.Scatter(
-                    x=cp_dates, y=cp_scores,
-                    mode="markers", name="Change Point",
-                    marker=dict(color="#f5576c", size=14, symbol="x",
-                                line=dict(width=2, color="white")),
-                ))
-                for d, s in zip(cp_dates, cp_scores):
-                    fig_cp.add_vline(x=d, line_dash="dot", line_color="rgba(245,87,108,0.3)")
-
-            # Local maxima/minima
-            for idx in extrema.get("maxima", []):
-                if idx < len(country_agg):
-                    fig_cp.add_trace(go.Scatter(
-                        x=[country_agg["date"].iloc[idx]],
-                        y=[country_agg["score"].iloc[idx]],
-                        mode="markers", name="Peak",
-                        marker=dict(color="#43e97b", size=8, symbol="triangle-up"),
-                        showlegend=idx == (extrema["maxima"][0] if extrema["maxima"] else -1),
-                    ))
-            for idx in extrema.get("minima", []):
-                if idx < len(country_agg):
-                    fig_cp.add_trace(go.Scatter(
-                        x=[country_agg["date"].iloc[idx]],
-                        y=[country_agg["score"].iloc[idx]],
-                        mode="markers", name="Valley",
-                        marker=dict(color="#fa709a", size=8, symbol="triangle-down"),
-                        showlegend=idx == (extrema["minima"][0] if extrema["minima"] else -1),
-                    ))
-
-            fig_cp = _apply_plotly_style(fig_cp, 420)
-            fig_cp.update_layout(
-                title=f"{t(LANG, 'change_points')} — {_country_name(sel_country)}",
-                hovermode="x unified",
-            )
-            st.plotly_chart(fig_cp, use_container_width=True)
-            st.info(f"📍 {tr('change_points_detected', count=len(change_pts))}")
-
-        # ── Alt Tab 4: Rolling Volatility + Bollinger ──
-        with ts_sub4:
-            vol_window = st.slider(tr("volatility_window"), 3, 30, 7, key="vol_window")
-            vol_df = rolling_volatility(country_agg["score"], window=vol_window)
-
-            fig_vol = make_subplots(
-                rows=2, cols=1, shared_xaxes=True,
-                subplot_titles=[tr("bollinger_bands"), tr("volatility_percent")],
-                row_heights=[0.65, 0.35], vertical_spacing=0.08,
-            )
-
-            # Bollinger bands
-            fig_vol.add_trace(go.Scatter(
-                x=country_agg["date"], y=vol_df["upper_band"],
-                mode="lines", line=dict(width=0), showlegend=False,
-            ), row=1, col=1)
-            fig_vol.add_trace(go.Scatter(
-                x=country_agg["date"], y=vol_df["lower_band"],
-                mode="lines", line=dict(width=0),
-                fill="tonexty", fillcolor="rgba(102,126,234,0.1)",
-                name="Bollinger Band",
-            ), row=1, col=1)
-            fig_vol.add_trace(go.Scatter(
-                x=country_agg["date"], y=vol_df["ma"],
-                mode="lines", name="MA",
-                line=dict(color="#667eea", width=2),
-            ), row=1, col=1)
-            fig_vol.add_trace(go.Scatter(
-                x=country_agg["date"], y=vol_df["value"],
-                mode="lines", name="Score",
-                line=dict(color="#764ba2", width=1), opacity=0.6,
-            ), row=1, col=1)
-
-            # Volatilite chart
-            fig_vol.add_trace(go.Bar(
-                x=country_agg["date"], y=vol_df["volatility_pct"],
-                name="Volatilite %",
-                marker=dict(
-                    color=vol_df["volatility_pct"],
-                    colorscale="YlOrRd",
-                    showscale=False,
-                ),
-            ), row=2, col=1)
-
-            fig_vol = _apply_plotly_style(fig_vol, 550)
-            fig_vol.update_layout(title=f"{tr('bollinger_bands')} & {tr('rolling_volatility')}")
-            st.plotly_chart(fig_vol, use_container_width=True)
-
-        # ── Alt Tab 5: Ensemble Forecast ──
-        with ts_sub5:
-            forecast_periods = st.slider(tr("forecast_periods"), 4, 24, 12, key="fc_periods")
-            forecast_df = advanced_forecast(country_agg["score"], periods=forecast_periods)
-
-            if not forecast_df.empty:
-                fc1, fc2, fc3 = st.columns(3)
-                fc1.metric(tr("model"), str(forecast_df["model"].iloc[0]))
-                fc2.metric("MAE", f"{forecast_df['mae'].iloc[0]:.2f}")
-                sp = int(forecast_df["seasonal_period"].iloc[0])
-                fc3.metric(tr("seasonal_period"), f"{sp}" if sp > 0 else "-")
-
-                fig_fc = go.Figure()
-                fig_fc.add_trace(go.Scatter(
-                    x=country_agg["date"], y=country_agg["score"],
-                    mode="lines", name=tr("historical_data"),
-                    line=dict(color="#667eea", width=2),
-                ))
-                fig_fc.add_trace(go.Scatter(
-                    x=forecast_df["ds"], y=forecast_df["yhat_upper"],
-                    mode="lines", line=dict(width=0), showlegend=False,
-                ))
-                fig_fc.add_trace(go.Scatter(
-                    x=forecast_df["ds"], y=forecast_df["yhat_lower"],
-                    mode="lines", line=dict(width=0),
-                    fill="tonexty", fillcolor="rgba(102,126,234,0.15)",
-                    name="95% CI",
-                ))
-                fig_fc.add_trace(go.Scatter(
-                    x=forecast_df["ds"], y=forecast_df["yhat"],
-                    mode="lines", name=t(LANG, "forecast"),
-                    line=dict(color="#f5576c", width=2.5, dash="dash"),
-                ))
-
-                fig_fc = _apply_plotly_style(fig_fc, 420)
-                fig_fc.update_layout(
-                    title=f"{_country_name(sel_country)} — {t(LANG, 'ensemble_forecast')}",
-                    hovermode="x unified",
-                )
-                st.plotly_chart(fig_fc, use_container_width=True)
-
-                with st.expander(f"📊 {tr('forecast')}"):
-                    st.dataframe(forecast_df, use_container_width=True, hide_index=True)
-            else:
-                st.info(tr("insufficient_forecast_data"))
-
-        # ── Korelasyon Analizi ──
-        st.divider()
-        with st.expander(f"🔗 {t(LANG, 'correlation')}"):
-            country_corr_timeline = timeline[timeline["city"].fillna("") == ""]
-            if country_corr_timeline.empty:
-                country_corr_timeline = timeline
-            corr_matrix = compute_correlation_matrix(country_corr_timeline, group_col="country")
-            if not corr_matrix.empty and corr_matrix.shape[0] > 1:
-                fig_corr = px.imshow(
-                    corr_matrix,
-                    color_continuous_scale="RdBu_r",
-                    zmin=-1, zmax=1,
-                    labels=dict(color="Korelasyon"),
-                )
-                fig_corr = _apply_plotly_style(fig_corr, 500)
-                fig_corr.update_layout(title=tr("country_correlation_title"))
-                st.plotly_chart(fig_corr, use_container_width=True)
-            else:
-                st.info(tr("correlation_requires_two"))
-
-        # ── Related Queries ──
-        st.divider()
-        with st.expander(f"🔍 {t(LANG, 'related_queries')}"):
-            if st.button(f"🔍 {sel_country} — {t(LANG, 'related_queries')}", key="rq_btn"):
-                with st.spinner(t(LANG, "loading")):
-                    cfg = FetchConfig(keyword=kw_display, hl=hl_map.get(LANG, "en-US"))
-                    client = _build_client(cfg)
-                    rq = fetch_related_queries(client, sel_country, cfg)
-                    col_rq1, col_rq2 = st.columns(2)
-                    with col_rq1:
-                        if not rq["top"].empty:
-                            st.markdown(f"**{tr('top_queries')}**")
-                            st.dataframe(rq["top"], use_container_width=True, hide_index=True)
-                    with col_rq2:
-                        if not rq["rising"].empty:
-                            st.markdown(f"**{tr('rising_queries')}**")
-                            st.dataframe(rq["rising"], use_container_width=True, hide_index=True)
-                    if rq["top"].empty and rq["rising"].empty:
-                        st.info(t(LANG, "no_data"))
-
-
-# ══════════════════════════════════════════════════════════════
-#  TAB 3: ŞEHİR DRILLDOWN
-# ══════════════════════════════════════════════════════════════
-
-with tab_city:
-    st.subheader(f"🏙️ {t(LANG, 'city_drilldown')}")
-
-    city_country = st.selectbox(t(LANG, "choose_country"), country_list, index=0, key="city_country")
-    country_cities_df = cities[cities["country"] == city_country].sort_values("score", ascending=False)
-    country_tl_city = timeline[timeline["country"] == city_country].copy()
-
-    if country_cities_df.empty:
-        st.warning(t(LANG, "no_data"))
-    else:
-        ranked = location_trend_ranking(country_cities_df)
-        st.dataframe(
-            ranked[["rank", "city", "score", "geo_code"]].head(20),
-            use_container_width=True, hide_index=True,
-        )
-
-        city_names = sorted([c for c in country_tl_city["city"].dropna().unique().tolist() if str(c).strip()])
-        if not city_names:
-            st.warning(t(LANG, "no_data"))
-        else:
-            sel_city = st.selectbox(t(LANG, "choose_city"), city_names, index=0, key="city_select")
-            city_ts = (
-                country_tl_city[country_tl_city["city"] == sel_city][["date", "score"]]
-                .sort_values("date").reset_index(drop=True)
-            )
-
-            if city_ts.empty:
-                st.warning(t(LANG, "no_data"))
-            else:
-                city_ts["score_clean"], outlier_count = clean_city_outliers(city_ts["score"])
-                city_signal = robust_trend_signal(city_ts["score_clean"])
-                city_scores = compute_trend_scores(city_ts["score_clean"])
-                city_mas = compute_moving_averages(city_ts["score_clean"])
-                city_strength = trend_strength_meter(city_ts["score_clean"])
-
-                cc1, cc2, cc3, cc4, cc5 = st.columns(5)
-                cc1.metric(t(LANG, "trend"), signal_label(city_signal))
-                cc2.metric("Slope", f"{city_signal['slope']:.3f}")
-                cc3.metric(tr("rolling_volatility"), f"{city_signal['volatility']:.1f}")
-                cc4.metric(t(LANG, "growth"), f"{city_scores['growth_rate']:+.1f}%")
-                cc5.metric(t(LANG, "trend_strength_meter"), f"{city_strength['score']:.0f}/100 - {strength_label(city_strength)}")
-
-                fig_city = go.Figure()
-                fig_city.add_trace(go.Scatter(
-                    x=city_ts["date"], y=city_ts["score"],
-                    mode="lines", name="Ham", opacity=0.3,
-                    line=dict(color="#bdc3c7", width=1),
-                ))
-                fig_city.add_trace(go.Scatter(
-                    x=city_ts["date"], y=city_ts["score_clean"],
-                    mode="lines", name="Clean",
-                    line=dict(color="#667eea", width=2),
-                    fill="tozeroy", fillcolor="rgba(102,126,234,0.05)",
-                ))
-                fig_city.add_trace(go.Scatter(
-                    x=city_ts["date"], y=city_mas["ma7"],
-                    mode="lines", name="7d MA",
-                    line=dict(color="#43e97b", width=1.5, dash="dot"),
-                ))
-
-                # Forecast
-                city_forecast = advanced_forecast(city_ts["score_clean"], periods=12)
-                if not city_forecast.empty:
-                    fig_city.add_trace(go.Scatter(
-                        x=city_forecast["ds"], y=city_forecast["yhat_upper"],
-                        mode="lines", line=dict(width=0), showlegend=False,
-                    ))
-                    fig_city.add_trace(go.Scatter(
-                        x=city_forecast["ds"], y=city_forecast["yhat_lower"],
-                        mode="lines", line=dict(width=0),
-                        fill="tonexty", fillcolor="rgba(102,126,234,0.1)",
-                        name="95% CI",
-                    ))
-                    fig_city.add_trace(go.Scatter(
-                        x=city_forecast["ds"], y=city_forecast["yhat"],
-                        mode="lines", name=t(LANG, "forecast"),
-                        line=dict(color="#f5576c", width=2, dash="dash"),
-                    ))
-
-                fig_city = _apply_plotly_style(fig_city, 420)
-                fig_city.update_layout(
-                    title=f"{sel_city}, {_country_name(city_country)}",
-                    hovermode="x unified",
-                )
-                st.plotly_chart(fig_city, use_container_width=True)
-                st.info(f"💡 {recommendation_from_signal(city_signal, lang=LANG)}")
-
-
-# ══════════════════════════════════════════════════════════════
-#  TAB 4: SAATLİK ANALİZ
-# ══════════════════════════════════════════════════════════════
-
-with tab_hourly:
-    st.subheader(f"⏰ {t(LANG, 'hourly')}")
-
-    hourly_geo = st.selectbox(t(LANG, "choose_country"), country_list, index=0, key="hourly_geo")
-
-    if st.button(f"⏰ {t(LANG, 'fetch_data')}", key="hourly_fetch"):
-        with st.spinner(t(LANG, "loading")):
-            cfg = FetchConfig(keyword=kw_display, hl=hl_map.get(LANG, "en-US"))
-            hourly_df = fetch_hourly_data(hourly_geo, config=cfg)
-            if hourly_df.empty:
-                st.warning(t(LANG, "no_data"))
-            else:
-                st.session_state["hourly_data"] = hourly_df
-                st.session_state["hourly_geo_label"] = hourly_geo
-                st.success(f"✅ {tr('data_points_loaded', count=len(hourly_df))}")
-
-    if "hourly_data" in st.session_state:
-        hdf = st.session_state["hourly_data"]
-        h_analysis = hourly_analysis(hdf, lang=LANG)
-
-        col_h1, col_h2 = st.columns([1, 1])
-
-        with col_h1:
-            if not h_analysis["avg_by_hour"].empty:
-                fig_hourly = px.bar(
-                    x=h_analysis["avg_by_hour"].index,
-                    y=h_analysis["avg_by_hour"].values,
-                    labels={"x": "Hour", "y": "Avg Score"},
-                    color=h_analysis["avg_by_hour"].values,
-                    color_continuous_scale="Viridis",
-                )
-                fig_hourly = _apply_plotly_style(fig_hourly, 380)
-                fig_hourly.update_layout(
-                    title=tr("hourly_average"),
-                    showlegend=False,
-                    coloraxis_showscale=False,
-                )
-                st.plotly_chart(fig_hourly, use_container_width=True)
-
-        with col_h2:
-            if not h_analysis["heatmap_matrix"].empty:
-                fig_hm = px.imshow(
-                    h_analysis["heatmap_matrix"],
-                    labels=dict(x="Hour", y="Day", color="Score"),
-                    color_continuous_scale="Viridis",
-                    aspect="auto",
-                )
-                fig_hm = _apply_plotly_style(fig_hm, 380)
-                fig_hm.update_layout(title=tr("day_hour_heatmap"))
-                st.plotly_chart(fig_hm, use_container_width=True)
-
-            st.success(f"🎯 {best_ad_hours_text(h_analysis['peak_hours'], lang=LANG)}")
-    else:
-        st.info(f"👆 {t(LANG, 'fetch_data')}")
-
-
-# ══════════════════════════════════════════════════════════════
-#  TAB 7: RANKING & TOP 10
-# ══════════════════════════════════════════════════════════════
-
-with tab_rank:
-    st.subheader(f"🏆 {t(LANG, 'ranking')}")
-
-    country_ranking_timeline = timeline[timeline["city"].fillna("") == ""]
-    if country_ranking_timeline.empty:
-        country_ranking_timeline = timeline
-    rising, falling = country_ranking(country_ranking_timeline, top_n=10)
-
-    col_r, col_f = st.columns(2)
-
-    with col_r:
-        st.markdown(f"### 📈 {t(LANG, 'rising')}")
-        if not rising.empty:
-            fig_rising = px.bar(
-                rising.head(10),
-                x="change_pct", y="country",
-                orientation="h",
-                color="change_pct",
-                color_continuous_scale="Greens",
-                labels={"change_pct": "Change %", "country": ""},
-            )
-            fig_rising = _apply_plotly_style(fig_rising, 380)
-            fig_rising.update_layout(yaxis=dict(autorange="reversed"), showlegend=False,
-                                     coloraxis_showscale=False)
-            st.plotly_chart(fig_rising, use_container_width=True)
-        else:
-            st.info(t(LANG, "no_data"))
-
-    with col_f:
-        st.markdown(f"### 📉 {t(LANG, 'falling')}")
-        if not falling.empty:
-            fig_falling = px.bar(
-                falling.head(10),
-                x="change_pct", y="country",
-                orientation="h",
-                color="change_pct",
-                color_continuous_scale="Reds_r",
-                labels={"change_pct": "Change %", "country": ""},
-            )
-            fig_falling = _apply_plotly_style(fig_falling, 380)
-            fig_falling.update_layout(yaxis=dict(autorange="reversed"), showlegend=False,
-                                      coloraxis_showscale=False)
-            st.plotly_chart(fig_falling, use_container_width=True)
-        else:
-            st.info(t(LANG, "no_data"))
-
-    st.divider()
-
-    st.subheader(f"🔀 {t(LANG, 'comparison')}")
-    compare_countries = st.multiselect(
-        t(LANG, "comparison"),
-        country_list,
-        default=country_list[:3] if len(country_list) >= 3 else country_list,
-        key="compare_countries",
-        label_visibility="collapsed",
+        fig_heatmap.update_layout(height=380, margin=dict(l=20, r=20, t=42, b=20))
+
+    return {
+        "has_data": True,
+        "country": country_code,
+        "peak_hours": analysis["peak_hours"],
+        "best_hours_text": best_ad_hours_text(analysis["peak_hours"], lang="tr"),
+        "charts": {
+            "avg_hour": _fig_to_dict(fig_hourly),
+            "heatmap": _fig_to_dict(fig_heatmap),
+        },
+    }
+
+
+def _render_ranking(timeline: pd.DataFrame, compare_countries: list[str] | None) -> dict:
+    base = timeline[timeline["city"].fillna("") == ""]
+    if base.empty:
+        base = timeline
+    rising, falling = country_ranking(base, top_n=10)
+
+    fig_rising = go.Figure()
+    if not rising.empty:
+        fig_rising = px.bar(rising.head(10), x="change_pct", y="country", orientation="h", color="change_pct", color_continuous_scale="Greens")
+        fig_rising.update_layout(height=370, margin=dict(l=20, r=20, t=20, b=20), yaxis=dict(autorange="reversed"), coloraxis_showscale=False)
+
+    fig_falling = go.Figure()
+    if not falling.empty:
+        fig_falling = px.bar(falling.head(10), x="change_pct", y="country", orientation="h", color="change_pct", color_continuous_scale="Reds_r")
+        fig_falling.update_layout(height=370, margin=dict(l=20, r=20, t=20, b=20), yaxis=dict(autorange="reversed"), coloraxis_showscale=False)
+
+    compare = compare_countries or sorted(base["country"].dropna().unique().tolist()[:3])
+    compare_data = base[base["country"].isin(compare)].copy()
+    compare_agg = compare_data.groupby(["country", "date"], as_index=False)["score"].mean() if not compare_data.empty else pd.DataFrame(columns=["country", "date", "score"])
+
+    fig_compare = go.Figure()
+    if not compare_agg.empty:
+        fig_compare = px.line(compare_agg, x="date", y="score", color="country")
+        fig_compare.update_layout(height=410, margin=dict(l=20, r=20, t=44, b=20), hovermode="x unified")
+
+    return {
+        "rising": rising.to_dict(orient="records"),
+        "falling": falling.to_dict(orient="records"),
+        "compare_selected": compare,
+        "charts": {
+            "rising": _fig_to_dict(fig_rising),
+            "falling": _fig_to_dict(fig_falling),
+            "compare": _fig_to_dict(fig_compare),
+        },
+    }
+
+
+def _render_raw(cities: pd.DataFrame, timeline: pd.DataFrame, search: str) -> dict:
+    city_df = cities.copy()
+    tl_df = timeline.copy()
+
+    if search:
+        city_df = city_df[
+            city_df["country"].astype(str).str.contains(search, case=False, na=False)
+            | city_df["city"].astype(str).str.contains(search, case=False, na=False)
+        ]
+        tl_df = tl_df[
+            tl_df["country"].astype(str).str.contains(search, case=False, na=False)
+            | tl_df["city"].astype(str).str.contains(search, case=False, na=False)
+        ]
+
+    tl_show = tl_df.sort_values(["country", "city", "date"]).copy() if not tl_df.empty else tl_df
+    if not tl_show.empty:
+        tl_show["date"] = pd.to_datetime(tl_show["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    return {
+        "city": city_df.head(1500).to_dict(orient="records"),
+        "timeline": tl_show.head(2500).to_dict(orient="records"),
+        "counts": {"city": int(len(city_df)), "timeline": int(len(tl_show))},
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def workspace_home(request: Request) -> HTMLResponse:
+    default_workspace = ensure_default_workspace()
+    records = [_workspace_payload(item) for item in list_workspaces()]
+    return templates.TemplateResponse(
+        "workspace.html",
+        {
+            "request": request,
+            "default_workspace_id": get_default_workspace_id() or default_workspace["id"],
+            "workspaces": records,
+            "countries": ALL_COUNTRIES,
+        },
     )
 
-    if compare_countries:
-        compare_data = timeline[timeline["country"].isin(compare_countries)].copy()
-        compare_agg = compare_data.groupby(["country", "date"], as_index=False)["score"].mean()
 
-        fig_compare = px.line(
-            compare_agg,
-            x="date", y="score",
-            color="country",
-            labels={"score": "Score", "date": "", "country": ""},
+@app.get("/dashboard", response_class=HTMLResponse)
+async def index(request: Request) -> HTMLResponse:
+    default_workspace = ensure_default_workspace()
+    records = [_workspace_payload(item) for item in list_workspaces()]
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "default_workspace_id": get_default_workspace_id() or default_workspace["id"],
+            "workspaces": records,
+            "countries": ALL_COUNTRIES,
+        },
+    )
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok", "service": "B2BTrend API"}
+
+
+@app.get("/api/workspaces")
+async def api_workspaces() -> dict:
+    records = [_workspace_payload(item) for item in list_workspaces()]
+    return {"items": records, "default_workspace_id": get_default_workspace_id()}
+
+
+@app.post("/api/workspaces")
+async def api_create_workspace(payload: WorkspaceCreate) -> dict:
+    created = create_workspace(name=payload.name, keyword=payload.keyword, countries=payload.countries)
+    updated = update_workspace(
+        created["id"],
+        name=payload.name,
+        language=payload.language,
+        keyword=payload.keyword,
+        countries=payload.countries,
+        use_topic_mode=payload.use_topic_mode,
+        country_keywords=_clean_country_keywords(payload.country_keywords, payload.countries),
+    )
+    await hub.broadcast({"type": "workspace_created", "workspace_id": updated["id"]})
+    return {"item": _workspace_payload(updated)}
+
+
+@app.patch("/api/workspaces/{workspace_id}")
+async def api_update_workspace(workspace_id: str, payload: WorkspaceUpdate) -> dict:
+    meta = load_workspace_meta(workspace_id)
+    updated = update_workspace(
+        workspace_id,
+        name=payload.name if payload.name is not None else str(meta.get("name") or workspace_id),
+        language=payload.language if payload.language is not None else str(meta.get("language") or "tr"),
+        keyword=payload.keyword if payload.keyword is not None else str(meta.get("keyword") or DEFAULT_KEYWORD),
+        countries=payload.countries if payload.countries is not None else list(meta.get("countries") or TOP_20_COUNTRIES),
+        use_topic_mode=payload.use_topic_mode if payload.use_topic_mode is not None else bool(meta.get("use_topic_mode", False)),
+        country_keywords=payload.country_keywords if payload.country_keywords is not None else dict(meta.get("country_keywords") or {}),
+    )
+    if payload.is_default:
+        set_default_workspace(workspace_id)
+    await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id})
+    return {"item": _workspace_payload(updated)}
+
+
+@app.delete("/api/workspaces/{workspace_id}")
+async def api_delete_workspace(workspace_id: str) -> dict:
+    delete_workspace(workspace_id)
+    await hub.broadcast({"type": "workspace_deleted", "workspace_id": workspace_id})
+    return {"ok": True}
+
+
+@app.post("/api/cache/clear")
+async def api_clear_cache() -> dict:
+    count = clear_cache()
+    await hub.broadcast({"type": "cache_cleared", "count": count})
+    return {"ok": True, "deleted": count}
+
+
+@app.post("/api/fetch")
+async def api_fetch(payload: FetchRequest) -> JSONResponse:
+    meta = load_workspace_meta(payload.workspace_id)
+    keyword = str(meta.get("keyword") or DEFAULT_KEYWORD).strip() or DEFAULT_KEYWORD
+    countries = list(meta.get("countries") or TOP_20_COUNTRIES)
+    use_topic_mode = bool(meta.get("use_topic_mode", False))
+    country_keywords = dict(meta.get("country_keywords") or {})
+    language = str(meta.get("language") or "tr").strip() or "tr"
+
+    try:
+        job = fetch_job_store.start_job(
+            workspace_id=payload.workspace_id,
+            keyword=keyword,
+            countries=countries,
+            use_topic_mode=use_topic_mode,
+            language=language,
+            country_keywords=_clean_country_keywords(country_keywords, countries),
         )
-        fig_compare = _apply_plotly_style(fig_compare, 400)
-        fig_compare.update_layout(title=t(LANG, "comparison"), hovermode="x unified")
-        st.plotly_chart(fig_compare, use_container_width=True)
+    except JobConflictError as exc:
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "Bu anda baska bir veri cekimi calisiyor", "job": exc.active_job})
+
+    await hub.broadcast({"type": "fetch_job_update", "state": job})
+    await hub.broadcast({"type": "fetch_started", "state": job})
+
+    loop = asyncio.get_running_loop()
+    worker = threading.Thread(
+        target=_run_fetch_job,
+        kwargs={
+            "job_id": job["job_id"],
+            "loop": loop,
+            "workspace_id": payload.workspace_id,
+            "keyword": keyword,
+            "countries": countries,
+            "language": language,
+            "use_topic_mode": use_topic_mode,
+            "country_keywords": _clean_country_keywords(country_keywords, countries),
+        },
+        daemon=True,
+    )
+    worker.start()
+
+    return JSONResponse(status_code=202, content={"ok": True, "job": job})
 
 
-# ══════════════════════════════════════════════════════════════
-#  TAB 8: HAM VERİ & EXPORT
-# ══════════════════════════════════════════════════════════════
+@app.post("/api/fetch/cancel")
+async def api_fetch_cancel(payload: FetchCancelRequest) -> JSONResponse:
+    snapshot = fetch_job_store.snapshot()
+    active = snapshot.get("active") or {}
+    if not active or active.get("status") not in {"queued", "running", "cancelling"}:
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "Iptal edilecek aktif bir cekim yok"})
 
-with tab_data:
-    st.subheader(f"📋 {t(LANG, 'raw_data')}")
+    workspace_id = str(payload.workspace_id or "").strip()
+    if workspace_id and active.get("workspace_id") != workspace_id:
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "Bu workspace icin aktif cekim yok", "job": active})
 
-    data_tab1, data_tab2 = st.tabs(["City Scores", "Timeline"])
+    updated = fetch_job_store.request_cancel(str(active.get("job_id") or ""))
+    if not updated:
+        return JSONResponse(status_code=409, content={"ok": False, "detail": "Iptal istegi uygulanamadi"})
 
-    with data_tab1:
-        search_country = st.text_input(f"🔍 {t(LANG, 'search_filter')}", "", key="search_country")
-        display_cities = cities.copy()
-        if search_country:
-            display_cities = display_cities[
-                display_cities["country"].str.contains(search_country, case=False, na=False)
-                | display_cities["city"].str.contains(search_country, case=False, na=False)
-            ]
-
-        st.dataframe(display_cities, use_container_width=True, hide_index=True)
-        st.download_button(
-            f"⬇️ {t(LANG, 'download_csv')}",
-            data=export_csv(display_cities),
-            file_name=f"city_scores_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-        )
-
-    with data_tab2:
-        search_tl = st.text_input(f"🔍 {t(LANG, 'search_filter')}", "", key="search_tl")
-        display_tl = timeline.copy()
-        if search_tl:
-            mask = (
-                display_tl["country"].str.contains(search_tl, case=False, na=False)
-                | display_tl["city"].str.contains(search_tl, case=False, na=False)
-            )
-            display_tl = display_tl[mask]
-
-        st.dataframe(
-            display_tl.sort_values(["country", "city", "date"]),
-            use_container_width=True, hide_index=True,
-        )
-        st.download_button(
-            f"⬇️ {t(LANG, 'download_csv')}",
-            data=export_csv(display_tl),
-            file_name=f"timeline_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-            mime="text/csv",
-        )
+    await hub.broadcast({"type": "fetch_job_update", "state": updated})
+    await hub.broadcast({"type": "fetch_cancel_requested", "state": updated})
+    return JSONResponse(status_code=200, content={"ok": True, "job": updated})
 
 
-# ══════════════════════════════════════════════════════════════
-#  FOOTER
-# ══════════════════════════════════════════════════════════════
+@app.get("/api/fetch/status")
+async def api_fetch_status() -> dict:
+    return fetch_job_store.snapshot()
 
-st.divider()
-st.markdown(f"""
-<div style="text-align:center; opacity:0.5; padding:12px 0;">
-    📊 B2BTrend v3.0 &nbsp;·&nbsp;
-    🔍 <strong>{kw_display}</strong> &nbsp;·&nbsp;
-    Professional Marketing Intelligence Suite
-</div>
-""", unsafe_allow_html=True)
+
+@app.get("/api/dashboard/overview")
+async def api_dashboard_overview(
+    workspace_id: str = Query(...),
+    range: str = Query("all"),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+    country: str | None = Query(None),
+) -> dict:
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    if cities.empty or timeline.empty:
+        return _empty_dashboard(meta, "No data yet. Run fetch to create the first dataset.")
+
+    country_summary = _country_summary(timeline)
+    if country_summary.empty:
+        return _empty_dashboard(meta, "No country data in selected date range")
+
+    selected_country = country if country and country in country_summary["country"].tolist() else str(country_summary.iloc[0]["country"])
+
+    metrics = {
+        "countries": int(country_summary["country"].nunique()),
+        "cities": int(cities["city"].nunique()),
+        "avg_score": round(float(country_summary["avg_score"].mean()), 2),
+        "best_country": _country_name(str(country_summary.iloc[0]["country"])),
+        "best_country_score": round(float(country_summary.iloc[0]["avg_score"]), 2),
+        "timeline_start": str(pd.to_datetime(timeline["date"]).min().date()),
+        "timeline_end": str(pd.to_datetime(timeline["date"]).max().date()),
+        "keyword": str(meta.get("keyword") or DEFAULT_KEYWORD),
+    }
+
+    world = await asyncio.to_thread(_render_world_charts, country_summary, cities, selected_country)
+
+    return {
+        "workspace": _workspace_payload(meta),
+        "has_data": True,
+        "selected_country": selected_country,
+        "country_options": country_summary[["country", "country_name", "avg_score", "iso3"]].to_dict(orient="records"),
+        "metrics": metrics,
+        "charts": world,
+    }
+
+
+@app.get("/api/dashboard/country")
+async def api_dashboard_country(
+    workspace_id: str = Query(...),
+    country: str = Query(...),
+    range: str = Query("all"),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+) -> dict:
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    if cities.empty or timeline.empty:
+        return _empty_dashboard(meta, "No data")
+
+    result = await asyncio.to_thread(_render_country_analysis, timeline, country)
+    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+
+
+@app.get("/api/dashboard/city")
+async def api_dashboard_city(
+    workspace_id: str = Query(...),
+    country: str = Query(...),
+    city: str | None = Query(None),
+    range: str = Query("all"),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+) -> dict:
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    if cities.empty or timeline.empty:
+        return _empty_dashboard(meta, "No data")
+
+    result = await asyncio.to_thread(_render_city_analysis, timeline, cities, country, city)
+    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+
+
+@app.get("/api/dashboard/hourly")
+async def api_dashboard_hourly(workspace_id: str = Query(...), country: str = Query(...)) -> dict:
+    meta = load_workspace_meta(workspace_id)
+    keyword = str(meta.get("keyword") or DEFAULT_KEYWORD)
+    result = await asyncio.to_thread(_render_hourly, keyword, country)
+    return {"workspace": _workspace_payload(meta), **result}
+
+
+@app.get("/api/dashboard/ranking")
+async def api_dashboard_ranking(
+    workspace_id: str = Query(...),
+    compare: str | None = Query(None),
+    range: str = Query("all"),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+) -> dict:
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    if cities.empty or timeline.empty:
+        return _empty_dashboard(meta, "No data")
+
+    compare_list = [x.strip().upper() for x in (compare or "").split(",") if x.strip()]
+    result = await asyncio.to_thread(_render_ranking, timeline, compare_list)
+    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+
+
+@app.get("/api/dashboard/raw")
+async def api_dashboard_raw(
+    workspace_id: str = Query(...),
+    search: str = Query(""),
+    range: str = Query("all"),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+) -> dict:
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    if cities.empty or timeline.empty:
+        return _empty_dashboard(meta, "No data")
+
+    result = await asyncio.to_thread(_render_raw, cities, timeline, search)
+    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+
+
+@app.get("/api/dashboard/related")
+async def api_dashboard_related(workspace_id: str = Query(...), country: str = Query(...)) -> dict:
+    meta = load_workspace_meta(workspace_id)
+    keyword = str(meta.get("keyword") or DEFAULT_KEYWORD)
+    cfg = FetchConfig(keyword=keyword, hl="tr-TR")
+
+    client = await asyncio.to_thread(_build_client, cfg)
+    try:
+        rq = await asyncio.to_thread(fetch_related_queries, client, country, cfg)
+        rt = await asyncio.to_thread(fetch_related_topics, client, country, cfg)
+    except Exception:
+        rq = {"top": pd.DataFrame(), "rising": pd.DataFrame()}
+        rt = {"top": pd.DataFrame(), "rising": pd.DataFrame()}
+
+    return {
+        "workspace": _workspace_payload(meta),
+        "country": country,
+        "queries": {
+            "top": rq["top"].to_dict(orient="records") if not rq["top"].empty else [],
+            "rising": rq["rising"].to_dict(orient="records") if not rq["rising"].empty else [],
+        },
+        "topics": {
+            "top": rt["top"].to_dict(orient="records") if not rt["top"].empty else [],
+            "rising": rt["rising"].to_dict(orient="records") if not rt["rising"].empty else [],
+        },
+    }
+
+
+@app.get("/api/export/csv")
+async def api_export_csv(
+    workspace_id: str = Query(...),
+    dataset: str = Query("city"),
+    range: str = Query("all"),
+    start: date | None = Query(None),
+    end: date | None = Query(None),
+) -> StreamingResponse:
+    _meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+
+    if dataset == "city":
+        content = export_csv(cities)
+        filename = f"city_scores_{workspace_id}.csv"
+    elif dataset == "timeline":
+        content = export_csv(timeline)
+        filename = f"timeline_{workspace_id}.csv"
+    else:
+        raise HTTPException(status_code=400, detail="dataset must be city or timeline")
+
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.websocket("/ws/status")
+async def ws_status(ws: WebSocket) -> None:
+    await hub.connect(ws)
+    await ws.send_json({"type": "connected"})
+    try:
+        while True:
+            try:
+                message = await asyncio.wait_for(ws.receive_text(), timeout=20)
+                if message.strip().lower() == "ping":
+                    await ws.send_json({"type": "pong"})
+            except TimeoutError:
+                await ws.send_json({"type": "heartbeat"})
+    except WebSocketDisconnect:
+        hub.disconnect(ws)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

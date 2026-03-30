@@ -1,0 +1,260 @@
+{% extends "base.html" %}
+
+{% block title %}B2BTrend Dashboard{% endblock %}
+
+{% block content %}
+<main class="layout" id="app-root"
+      data-workspaces='{{ workspaces | tojson }}'
+      data-default-workspace='{{ default_workspace_id }}'
+      data-countries='{{ countries | tojson }}'>
+
+  <section class="topbar card">
+    <div>
+      <p class="eyebrow">B2BTrend</p>
+      <h1>Google Trends Intelligence Suite</h1>
+      <p class="subtitle">Eski sistemdeki tum analiz sayfalari FastAPI + Jinja2 ile geri getirildi</p>
+    </div>
+    <div class="toolbar-inline">
+      <a class="btn" href="/">Workspace Sayfasi</a>
+      <label>Tema</label>
+      <div class="theme-toggle" role="group" aria-label="Tema secimi">
+        <button type="button" class="btn theme-btn" data-theme="system">Sistem</button>
+        <button type="button" class="btn theme-btn" data-theme="light">Acik</button>
+        <button type="button" class="btn theme-btn" data-theme="dark">Koyu</button>
+      </div>
+      <div class="status-wrap">
+        <span class="status-dot" id="ws-indicator"></span>
+        <span id="ws-label">Realtime kanal baglaniyor...</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="controls card">
+    <div class="control-field">
+      <label>Workspace</label>
+      <select id="workspace-select"></select>
+    </div>
+
+    <div class="control-field">
+      <label>Tarih Araligi</label>
+      <select id="range-select">
+        <option value="all">Tum Zaman</option>
+        <option value="1m">Son 1 Ay</option>
+        <option value="3m">Son 3 Ay</option>
+        <option value="6m">Son 6 Ay</option>
+      </select>
+    </div>
+
+    <div class="control-actions">
+      <button id="fetch-btn" class="btn btn-primary">Veri Cek</button>
+      <button id="clear-cache-btn" class="btn">Cache Temizle</button>
+      <button id="refresh-btn" class="btn">Yenile</button>
+      <button id="new-workspace-btn" class="btn">Yeni Workspace</button>
+    </div>
+  </section>
+
+  <section class="metrics" id="metrics-row"></section>
+
+  <section class="tabs card">
+    <button class="tab-btn is-active" data-tab="tab-map">Dunya Haritasi</button>
+    <button class="tab-btn" data-tab="tab-country">Ulke Analizi</button>
+    <button class="tab-btn" data-tab="tab-city">Sehir Drilldown</button>
+    <button class="tab-btn" data-tab="tab-hourly">Saatlik</button>
+    <button class="tab-btn" data-tab="tab-ranking">Ranking</button>
+    <button class="tab-btn" data-tab="tab-raw">Ham Veri</button>
+  </section>
+
+  <section id="tab-map" class="tab-panel is-active">
+    <article class="card">
+      <div class="panel-toolbar">
+        <h2>Dunya Haritasi ve Drilldown</h2>
+        <div class="toolbar-inline">
+          <label>Ulke</label>
+          <select id="map-country-select"></select>
+          <label>Mod</label>
+          <select id="map-mode-select">
+            <option value="overview">Overview + Drilldown</option>
+            <option value="world-city">Global Sehir Haritasi</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div id="chart-world" class="plot-box"></div>
+        <div id="chart-drill" class="plot-box"></div>
+      </div>
+      <div id="chart-world-city" class="plot-box hidden"></div>
+      <div class="table-wrap">
+        <table id="drill-table">
+          <thead><tr><th>Sehir</th><th>Skor</th><th>Geo</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </article>
+  </section>
+
+  <section id="tab-country" class="tab-panel">
+    <article class="card">
+      <div class="panel-toolbar">
+        <h2>Ulke Zaman Serisi ve Ileri Analiz</h2>
+        <div class="toolbar-inline">
+          <label>Ulke</label>
+          <select id="country-analysis-select"></select>
+          <button id="related-refresh-btn" class="btn">Related Yenile</button>
+        </div>
+      </div>
+      <section class="sub-tabs">
+        <button class="sub-tab-btn is-active" data-subtab="overview">Genel Bakis</button>
+        <button class="sub-tab-btn" data-subtab="change">Degisim Noktalari</button>
+        <button class="sub-tab-btn" data-subtab="stl">STL Ayrisimi</button>
+        <button class="sub-tab-btn" data-subtab="vol">Volatilite</button>
+        <button class="sub-tab-btn" data-subtab="forecast">Forecast</button>
+        <button class="sub-tab-btn" data-subtab="corr">Korelasyon</button>
+      </section>
+      <section class="metrics metrics-5" id="country-metrics"></section>
+      <section class="group-card" data-subtab="overview">
+        <h3>1) Trend Genel Bakis</h3>
+        <div id="chart-country-overview" class="plot-box"></div>
+      </section>
+      <section class="group-card" data-subtab="change">
+        <h3>2) Degisim Noktalari</h3>
+        <div id="chart-country-change" class="plot-box"></div>
+      </section>
+      <section class="group-card" data-subtab="stl">
+        <h3>3) STL Ayrisimi</h3>
+        <div id="chart-country-stl" class="plot-box tall"></div>
+      </section>
+      <section class="group-card" data-subtab="vol">
+        <h3>4) Volatilite ve Bollinger</h3>
+        <div id="chart-country-vol" class="plot-box tall"></div>
+      </section>
+      <section class="group-card" data-subtab="forecast">
+        <h3>5) Forecast</h3>
+        <div id="chart-country-forecast" class="plot-box"></div>
+      </section>
+      <section class="group-card" data-subtab="corr">
+        <h3>6) Ulkeler Arasi Korelasyon</h3>
+        <div id="chart-country-corr" class="plot-box"></div>
+      </section>
+      <div class="grid-2">
+        <article>
+          <h3>Related Queries</h3>
+          <div class="table-wrap small-table"><table id="related-queries-top"><thead><tr><th>Query</th><th>Value</th></tr></thead><tbody></tbody></table></div>
+          <div class="table-wrap small-table"><table id="related-queries-rising"><thead><tr><th>Query</th><th>Value</th></tr></thead><tbody></tbody></table></div>
+        </article>
+        <article>
+          <h3>Related Topics</h3>
+          <div class="table-wrap small-table"><table id="related-topics-top"><thead><tr><th>Topic</th><th>Value</th></tr></thead><tbody></tbody></table></div>
+          <div class="table-wrap small-table"><table id="related-topics-rising"><thead><tr><th>Topic</th><th>Value</th></tr></thead><tbody></tbody></table></div>
+        </article>
+      </div>
+    </article>
+  </section>
+
+  <section id="tab-city" class="tab-panel">
+    <article class="card">
+      <div class="panel-toolbar">
+        <h2>Sehir Drilldown</h2>
+        <div class="toolbar-inline">
+          <label>Ulke</label>
+          <select id="city-country-select"></select>
+          <label>Sehir</label>
+          <select id="city-select"></select>
+        </div>
+      </div>
+      <section class="metrics metrics-5" id="city-metrics"></section>
+      <div class="grid-2">
+        <div id="chart-city-trend" class="plot-box"></div>
+        <div class="table-wrap"><table id="city-ranking-table"><thead><tr><th>Rank</th><th>Sehir</th><th>Skor</th><th>Geo</th></tr></thead><tbody></tbody></table></div>
+      </div>
+    </article>
+  </section>
+
+  <section id="tab-hourly" class="tab-panel">
+    <article class="card">
+      <div class="panel-toolbar">
+        <h2>Saatlik Analiz</h2>
+        <div class="toolbar-inline">
+          <label>Ulke</label>
+          <select id="hourly-country-select"></select>
+          <button id="hourly-refresh-btn" class="btn">Saatlik Cek</button>
+        </div>
+      </div>
+      <p id="hourly-best-hours" class="inline-note"></p>
+      <div class="grid-2">
+        <div id="chart-hourly-avg" class="plot-box"></div>
+        <div id="chart-hourly-heatmap" class="plot-box"></div>
+      </div>
+    </article>
+  </section>
+
+  <section id="tab-ranking" class="tab-panel">
+    <article class="card">
+      <div class="panel-toolbar">
+        <h2>Ranking ve Karsilastirma</h2>
+        <div class="toolbar-inline">
+          <label>Compare (CC,CC,CC)</label>
+          <input id="compare-input" placeholder="TR,US,DE" />
+          <button id="ranking-refresh-btn" class="btn">Uygula</button>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div id="chart-ranking-rising" class="plot-box"></div>
+        <div id="chart-ranking-falling" class="plot-box"></div>
+      </div>
+      <div id="chart-ranking-compare" class="plot-box"></div>
+    </article>
+  </section>
+
+  <section id="tab-raw" class="tab-panel">
+    <article class="card">
+      <div class="panel-toolbar">
+        <h2>Ham Veri ve Export</h2>
+        <div class="toolbar-inline">
+          <label>Search</label>
+          <input id="raw-search-input" placeholder="TR veya city" />
+          <button id="raw-refresh-btn" class="btn">Filtrele</button>
+          <button id="download-city-btn" class="btn">City CSV</button>
+          <button id="download-timeline-btn" class="btn">Timeline CSV</button>
+        </div>
+      </div>
+      <h3>City Scores</h3>
+      <div class="table-wrap raw-table"><table id="raw-city-table"><thead><tr><th>Country</th><th>City</th><th>Geo</th><th>Score</th></tr></thead><tbody></tbody></table></div>
+      <h3>Timeline</h3>
+      <div class="table-wrap raw-table"><table id="raw-timeline-table"><thead><tr><th>Country</th><th>City</th><th>Date</th><th>Score</th></tr></thead><tbody></tbody></table></div>
+    </article>
+  </section>
+
+  <dialog id="workspace-dialog" class="modal">
+    <form method="dialog" id="workspace-form">
+      <h3>Yeni Workspace</h3>
+      <input type="hidden" id="ws-id" />
+      <label>Ad</label>
+      <input id="ws-name" required placeholder="Orn: tavuk_uluk" />
+
+      <label>Keyword veya Topic ID</label>
+      <input id="ws-keyword" value="/m/02vqb5x" required />
+
+      <label>Ulkeler (CC, virgulle)</label>
+      <input id="ws-countries" placeholder="TR,US,DE" value="TR,US,DE" />
+
+      <label class="inline-check">
+        <input id="ws-topic-mode" type="checkbox" /> Google Topic ID modu (/m/...)
+      </label>
+
+      <label>Ulkeye Ozel Anahtar Kelimeler (CC:kelime)</label>
+      <textarea id="ws-country-keywords" rows="5" placeholder="TR:tavuk&#10;US:chicken&#10;DE:huhn"></textarea>
+
+      <div class="modal-actions">
+        <button type="submit" class="btn btn-primary">Olustur</button>
+        <button type="button" id="workspace-cancel" class="btn">Iptal</button>
+      </div>
+    </form>
+  </dialog>
+
+  <section class="toast" id="toast"></section>
+</main>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/app.js"></script>
+{% endblock %}
