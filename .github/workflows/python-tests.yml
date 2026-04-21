@@ -35,7 +35,7 @@ jobs:
   integration-fetch:
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name != 'schedule'
+    if: github.event_name == 'workflow_dispatch'
     env:
       PYTHONPATH: ${{ github.workspace }}
     steps:
