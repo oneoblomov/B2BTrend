@@ -10,3 +10,4 @@
 *.json
 *.csv
 *.bak
+!/data/city_geocache.csv
