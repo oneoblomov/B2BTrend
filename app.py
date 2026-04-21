@@ -9,6 +9,7 @@ import threading
 from datetime import date
 from pathlib import Path
 
+import jinja2
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -85,7 +86,13 @@ STATIC_DIR = ROOT / "static"
 
 app = FastAPI(title="B2BTrend", version="4.2.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+jinja_env = jinja2.Environment(
+    loader=jinja2.FileSystemLoader(str(TEMPLATES_DIR)),
+    autoescape=True,
+    cache_size=0,
+)
+templates = Jinja2Templates(env=jinja_env)
 logger = logging.getLogger(__name__)
 
 
