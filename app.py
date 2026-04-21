@@ -1109,6 +1109,7 @@ async def workspace_home(request: Request) -> HTMLResponse:
     default_workspace = ensure_default_workspace()
     records = [_workspace_payload(item) for item in list_workspaces()]
     return templates.TemplateResponse(
+        request,
         "workspace.html",
         {
             "request": request,
@@ -1124,6 +1125,7 @@ async def index(request: Request) -> HTMLResponse:
     default_workspace = ensure_default_workspace()
     records = [_workspace_payload(item) for item in list_workspaces()]
     return templates.TemplateResponse(
+        request,
         "index.html",
         {
             "request": request,

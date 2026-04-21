@@ -11,7 +11,7 @@ selenium
 urllib3
 pyarrow
 fastapi==0.129.0
-starlette==0.28.1
+starlette==0.28.0
 Jinja2==3.1.6
 uvicorn==0.24.0
 websocket-client
