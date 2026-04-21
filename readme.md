@@ -14,9 +14,12 @@ B2BTrend, Google Trends verisini anahtar kelime / Topic ID bazında hızlıca ç
 
 - Kullanıcı dostu arayüz ve minimal bağımlılıklar
 - Güvenilir cache (parquet) + TTL + maksimum boyut sınırı
+- Anti-blocking fetch akışı: adaptif zamanlama + jitter + burst cooldown
+- Gerçekçi oturum yaklaşımı: kalıcı Google cookie profili (`data/active/google_cookie_profile.json`)
 - Workspace bazli tek CSV veri dosyasi + JSON metadata
 - Topic ID modu veya ulke bazli arama metni (TR:tavuk, US:chicken vb.)
 - Varsayilan workspace secimi ve otomatik acilis
+- Kaldigi yerden devam: workspace bazli checkpoint (`data/workspaces/<workspace_id>/fetch_checkpoint.json`)
 - Çoklu dil destekleri (TR / EN) + `locales/` üstü çeviri
 - `pytest` tabanlı birim testi ve CI entegrasyonu
 
@@ -80,15 +83,21 @@ http://127.0.0.1:8000
 
 1. Arayüzde workspace seçilir (keyword/topic, ülkeler, dil ayarı).
 2. `/api/fetch` ile `fetch_trends_dataset()` çağrılır (şehir + timeline API çağrıları).
-3. Çekilen veriler dairesel cache’e kaydedilir (`data/cache/`), TTL ve boyut uygulanır.
-4. Workspace verisi `data/workspaces/<workspace_id>/dataset.csv` dosyasina tek CSV olarak yazilir.
-5. Workspace ayarlari (arama metni, ulkeler vb.) `metadata.json` icinde tutulur.
-6. `/api/dashboard` ile `src/analytics.py` tabanlı metrikler hesaplanır ve Plotly figürleri JSON olarak döner.
-7. Frontend (`static/js/app.js`) Plotly ile grafikleri interaktif render eder.
+3. Veri çekimi sirasi ülke-oncelikli ilerler: once tum ulkelerin timeline verisi, sonra sehir listeleri, sonra sehir timeline verileri.
+4. Çekim sirasinda periyodik partial save + checkpoint yazilir; hata/kapanma durumunda son durum korunur.
+5. Çekilen veriler dairesel cache’e kaydedilir (`data/cache/`), TTL ve boyut uygulanır.
+6. Workspace verisi `data/workspaces/<workspace_id>/dataset.csv` dosyasina tek CSV olarak yazilir.
+7. Workspace ayarlari (arama metni, ulkeler vb.) `metadata.json` icinde tutulur.
+8. `/api/dashboard` ile `src/analytics.py` tabanlı metrikler hesaplanır ve Plotly figürleri JSON olarak döner.
+9. Frontend (`static/js/app.js`) Plotly ile grafikleri interaktif render eder.
 
 ## Özelleştirme ve gelişmiş kullanım
 
 - `src/config.py` içindeki `CACHE_TTL_HOURS`, `CACHE_MAX_BYTES`, `DEFAULT_LANG` gibi değerler değiştirilebilir.
+- IP blok riskini azaltmak için `.env` ile ayarlanabilen kritik alanlar: `FETCH_PHASE_COUNTRY_FACTOR`, `FETCH_PHASE_CITY_TIMELINE_FACTOR`
+- Burst dengelemesi için: `FETCH_BURST_EVERY`, `FETCH_BURST_MIN_SLEEP`, `FETCH_BURST_MAX_SLEEP`
+- Hata sonrası geri cekilme için: `FETCH_RETRY_COOLDOWN_BASE`, `FETCH_RETRY_COOLDOWN_MAX`
+- Kalici cookie profil kullanimi için: `ENABLE_COOKIE_PROFILE`, `COOKIE_PROFILE_TTL_HOURS`
 - Kendi sorgu iş akışı için:
 
 ```python

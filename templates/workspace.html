@@ -6,28 +6,30 @@
 <main class="layout" id="workspace-root" data-workspaces='{{ workspaces | tojson }}'>
   <section class="topbar card">
     <div>
-      <p class="eyebrow">B2BTrend</p>
+      <p class="eyebrow"><a class="brand-link" href="/dashboard">B2BTrend</a></p>
       <h1>Workspace Hub</h1>
-      <p class="subtitle">Projeleri tek ekrandan yonet: sec, varsayilan yap, duzenle, sil, yeni ekle</p>
     </div>
     <div class="toolbar-inline">
-      <label>Tema</label>
       <div class="theme-toggle" role="group" aria-label="Tema secimi">
-        <button type="button" class="btn theme-btn" data-theme="system">Sistem</button>
-        <button type="button" class="btn theme-btn" data-theme="light">Acik</button>
-        <button type="button" class="btn theme-btn" data-theme="dark">Koyu</button>
+        <button type="button" class="btn theme-btn" data-theme="system" title="Sistem" aria-label="Sistem tema">🖥️</button>
+        <button type="button" class="btn theme-btn" data-theme="light" title="Açık" aria-label="Açık tema">☀️</button>
+        <button type="button" class="btn theme-btn" data-theme="dark" title="Koyu" aria-label="Koyu tema">🌙</button>
       </div>
-      <div class="status-wrap">
-        <span class="status-dot" id="ws-indicator"></span>
-        <span id="ws-label">Arkaplan veri cekimi izleniyor...</span>
-      </div>
-      <a class="btn btn-primary" href="/dashboard">Dashboard Ac</a>
+
+      <a class="btn" href="/dashboard" title="Dashboard" style="margin-right: 8px;">Dashboard Aç</a>
       <button id="ws-new-btn" class="btn icon-btn" title="Yeni Workspace">+</button>
     </div>
   </section>
 
   <section class="card">
     <div class="workspace-grid" id="workspace-grid"></div>
+  </section>
+
+  <section class="status-card card">
+    <div class="status-wrap">
+      <span class="status-dot" id="ws-indicator"></span>
+      <span id="ws-label">Arkaplan veri cekimi izleniyor...</span>
+    </div>
   </section>
 
   <dialog id="ws-dialog" class="modal">
@@ -41,7 +43,7 @@
       <label>Keyword veya Topic ID</label>
       <input id="ws-keyword" required value="/m/02vqb5x" />
 
-      <label>Ulkeler (CC, virgulle)</label>
+      <label>Ulkeler (CC, virgul/bosluk/satir sonu)</label>
       <input id="ws-countries" value="TR,US,DE" />
 
       <label class="inline-check">

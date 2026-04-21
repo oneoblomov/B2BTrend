@@ -70,6 +70,7 @@ body {
   min-height: 100vh;
   padding-top: 132px;
   padding-bottom: 32px;
+  overflow-x: hidden;
 }
 
 .bg-grid {
@@ -87,7 +88,10 @@ body {
   width: min(1240px, 94vw);
   margin: 24px auto 40px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .card {
@@ -96,6 +100,22 @@ body {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   padding: 18px;
+  min-width: 0;
+}
+
+.status-card {
+  margin-top: 12px;
+  padding: 12px;
+  background: color-mix(in srgb, var(--paper), #f8faf9 50%);
+  border-color: var(--line);
+}
+
+.status-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink);
+  font-size: 0.92rem;
 }
 
 .topbar {
@@ -103,6 +123,7 @@ body {
   justify-content: space-between;
   align-items: flex-end;
   gap: 16px;
+  min-width: 0;
 }
 
 .topbar h1 {
@@ -124,14 +145,6 @@ body {
 .subtitle {
   margin: 8px 0 0;
   color: var(--muted);
-}
-
-.status-wrap {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 0.92rem;
 }
 
 .btn-compact {
@@ -302,6 +315,24 @@ body {
   line-height: 1.45;
 }
 
+.notification-item__meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.notification-item__progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-weight: 700;
+}
+
 .notification-item__progress {
   height: 8px;
   border-radius: 999px;
@@ -461,6 +492,8 @@ body {
   grid-template-columns: 1.3fr 1fr auto;
   gap: 14px;
   align-items: end;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .control-field {
@@ -519,8 +552,8 @@ textarea {
 }
 
 .theme-btn {
-  padding: 0 12px;
-  min-width: 72px;
+  padding: 0 10px;
+  min-width: 42px;
   border-radius: 999px;
   border: 1px solid var(--line);
   background: var(--paper);
@@ -528,7 +561,7 @@ textarea {
   font-weight: 700;
   height: 34px;
   line-height: 1;
-  font-size: 0.82rem;
+  font-size: 1.0rem;
   transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease;
 }
 
@@ -695,15 +728,17 @@ textarea {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  min-width: 0;
 }
 
 .metric {
-  padding: 14px;
+  padding: 12px;
   border-radius: 14px;
   border: 1px solid var(--line);
   background: linear-gradient(150deg, color-mix(in srgb, var(--paper), #ffffff 35%), color-mix(in srgb, var(--paper), #ffffff 25%));
+  min-width: 0;
 }
 
 .metric p {
@@ -722,12 +757,14 @@ textarea {
   display: grid;
   grid-template-columns: 1fr;
   gap: 14px;
+  min-width: 0;
 }
 
 .plot-box {
   min-height: 340px;
   width: 100%;
   max-width: 100%;
+  min-width: 0;
   margin: 0 auto;
 }
 
@@ -735,6 +772,8 @@ textarea {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .tab-btn {
@@ -755,6 +794,8 @@ textarea {
 
 .tab-panel {
   display: none;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .tab-panel.is-active {
@@ -766,6 +807,8 @@ textarea {
   flex-wrap: wrap;
   gap: 6px;
   margin-bottom: 16px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .sub-tab-btn {
@@ -787,6 +830,8 @@ textarea {
 .panel-toolbar,
 .toolbar-inline {
   color: var(--ink);
+  min-width: 0;
+  max-width: 100%;
 }
 
 .table-wrap table {
@@ -805,6 +850,8 @@ table td {
   margin-bottom: 10px;
   background: color-mix(in srgb, var(--paper), transparent 6%);
   display: none;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .group-card.is-active {
@@ -817,6 +864,7 @@ table td {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 12px;
+  min-width: 0;
 }
 
 .panel-toolbar h2 {
@@ -828,6 +876,7 @@ table td {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .toolbar-inline input,
@@ -836,7 +885,7 @@ table td {
 }
 
 .metrics-5 {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   margin-bottom: 10px;
 }
 
@@ -868,6 +917,8 @@ table td {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 12px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .ws-card {
@@ -875,6 +926,7 @@ table td {
   border-radius: 16px;
   padding: 14px;
   background: var(--ws-card-bg);
+  min-width: 0;
 }
 
 .ws-card h3 {
@@ -918,15 +970,36 @@ table td {
 .plot-box {
   min-height: 340px;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.plot-box .js-plotly-plot,
+.plot-box .plot-container,
+.plot-box .svg-container,
+.plot-box .main-svg,
+.plot-box .cartesianlayer,
+.plot-box .geolayer {
+  width: 100% !important;
+  max-width: 100% !important;
+  min-width: 0 !important;
 }
 
 .table-wrap {
   overflow: auto;
+  max-width: 100%;
+  min-width: 0;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
+}
+
+th,
+td {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 th,
@@ -1001,16 +1074,29 @@ th {
     flex-wrap: wrap;
   }
 
-  .metrics {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
+  .metrics,
   .metrics-5 {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   }
 
   .grid-2 {
     grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .toolbar-inline {
+    width: 100%;
+  }
+
+  .toolbar-inline input,
+  .toolbar-inline select {
+    min-width: 0;
+    width: 100%;
+    flex: 1 1 180px;
   }
 }
 
@@ -1056,7 +1142,37 @@ th {
     justify-content: flex-start;
   }
 
-  .metrics {
-    grid-template-columns: 1fr;
+  .metrics,
+  .metrics-5 {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  }
+
+  .control-actions {
+    width: 100%;
+  }
+
+  .control-actions .btn {
+    flex: 1 1 0;
+  }
+
+  .panel-toolbar,
+  .toolbar-inline {
+    width: 100%;
+  }
+
+  .panel-toolbar h2 {
+    width: 100%;
+  }
+
+  .panel-toolbar .toolbar-inline {
+    align-items: stretch;
+  }
+
+  .plot-box,
+  .plot-box .js-plotly-plot,
+  .plot-box .plot-container,
+  .plot-box .svg-container {
+    width: 100% !important;
+    max-width: 100% !important;
   }
 }

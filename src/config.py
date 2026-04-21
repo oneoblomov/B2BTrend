@@ -489,6 +489,21 @@ PROXIES: list[str] = [
 FETCH_MIN_SLEEP = float(os.getenv("FETCH_MIN_SLEEP", "4.0"))
 FETCH_MAX_SLEEP = float(os.getenv("FETCH_MAX_SLEEP", "9.0"))
 
+ENABLE_COOKIE_PROFILE = _env_flag("ENABLE_COOKIE_PROFILE", True)
+COOKIE_PROFILE_TTL_HOURS = int(os.getenv("COOKIE_PROFILE_TTL_HOURS", "96"))
+COOKIE_PROFILE_FILE = ACTIVE_DATA_DIR / "google_cookie_profile.json"
+
+FETCH_PHASE_COUNTRY_FACTOR = float(os.getenv("FETCH_PHASE_COUNTRY_FACTOR", "0.75"))
+FETCH_PHASE_CITY_LIST_FACTOR = float(os.getenv("FETCH_PHASE_CITY_LIST_FACTOR", "1.0"))
+FETCH_PHASE_CITY_TIMELINE_FACTOR = float(os.getenv("FETCH_PHASE_CITY_TIMELINE_FACTOR", "1.25"))
+FETCH_BURST_EVERY = int(os.getenv("FETCH_BURST_EVERY", "10"))
+FETCH_BURST_MIN_SLEEP = float(os.getenv("FETCH_BURST_MIN_SLEEP", "10.0"))
+FETCH_BURST_MAX_SLEEP = float(os.getenv("FETCH_BURST_MAX_SLEEP", "22.0"))
+FETCH_RETRY_COOLDOWN_BASE = float(os.getenv("FETCH_RETRY_COOLDOWN_BASE", "8.0"))
+FETCH_RETRY_COOLDOWN_MAX = float(os.getenv("FETCH_RETRY_COOLDOWN_MAX", "120.0"))
+
+USER_AGENT = os.getenv("USER_AGENT")  # Opsiyonel, None ise rastgele kullanılır
+
 TELEGRAM_BOT_TOKEN: str | None = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID: str | None = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -499,6 +514,24 @@ SMTP_PASSWORD: str | None = os.getenv("SMTP_PASSWORD")
 ALERT_EMAIL_TO: str | None = os.getenv("ALERT_EMAIL_TO")
 
 SPIKE_Z_THRESHOLD = float(os.getenv("SPIKE_Z_THRESHOLD", "2.5"))
+
+USER_AGENTS: list[str] = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPad; CPU OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Android 13; Mobile; rv:121.0) Gecko/121.0 Firefox/121.0",
+    "Mozilla/5.0 (Android 13; Mobile; LG-M255; rv:121.0) Gecko/121.0 Firefox/121.0",
+    "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 10; SM-A505FN) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+]
 
 TIMEFRAME_OPTIONS: dict[str, str] = {
     "now 1-H": "Last 1 hour",

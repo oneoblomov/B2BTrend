@@ -10,46 +10,11 @@
 
   <section class="topbar card">
     <div>
-      <p class="eyebrow">B2BTrend</p>
+      <p class="eyebrow"><a class="brand-link" href="/">B2BTrend</a></p>
       <h1>Google Trends Intelligence Suite</h1>
-      <p class="subtitle">Eski sistemdeki tum analiz sayfalari FastAPI + Jinja2 ile geri getirildi</p>
     </div>
     <div class="toolbar-inline">
-      <a class="btn" href="/">Workspace Sayfasi</a>
-      <label>Tema</label>
-      <div class="theme-toggle" role="group" aria-label="Tema secimi">
-        <button type="button" class="btn theme-btn" data-theme="system">Sistem</button>
-        <button type="button" class="btn theme-btn" data-theme="light">Acik</button>
-        <button type="button" class="btn theme-btn" data-theme="dark">Koyu</button>
-      </div>
-      <div class="status-wrap">
-        <span class="status-dot" id="ws-indicator"></span>
-        <span id="ws-label">Realtime kanal baglaniyor...</span>
-      </div>
-    </div>
-  </section>
-
-  <section class="controls card">
-    <div class="control-field">
-      <label>Workspace</label>
-      <select id="workspace-select"></select>
-    </div>
-
-    <div class="control-field">
-      <label>Tarih Araligi</label>
-      <select id="range-select">
-        <option value="all">Tum Zaman</option>
-        <option value="1m">Son 1 Ay</option>
-        <option value="3m">Son 3 Ay</option>
-        <option value="6m">Son 6 Ay</option>
-      </select>
-    </div>
-
-    <div class="control-actions">
-      <button id="fetch-btn" class="btn btn-primary">Veri Cek</button>
-      <button id="clear-cache-btn" class="btn">Cache Temizle</button>
-      <button id="refresh-btn" class="btn">Yenile</button>
-      <button id="new-workspace-btn" class="btn">Yeni Workspace</button>
+      <!-- workspace button removed: now B2BTrend link is the workspace shortcut -->
     </div>
   </section>
 
@@ -99,7 +64,7 @@
         <div class="toolbar-inline">
           <label>Ulke</label>
           <select id="country-analysis-select"></select>
-          <button id="related-refresh-btn" class="btn">Related Yenile</button>
+          <button id="related-refresh-btn" class="btn" style="display: none">Related Yenile</button>
         </div>
       </div>
       <section class="sub-tabs">
@@ -112,40 +77,24 @@
       </section>
       <section class="metrics metrics-5" id="country-metrics"></section>
       <section class="group-card" data-subtab="overview">
-        <h3>1) Trend Genel Bakis</h3>
         <div id="chart-country-overview" class="plot-box"></div>
       </section>
       <section class="group-card" data-subtab="change">
-        <h3>2) Degisim Noktalari</h3>
         <div id="chart-country-change" class="plot-box"></div>
       </section>
       <section class="group-card" data-subtab="stl">
-        <h3>3) STL Ayrisimi</h3>
         <div id="chart-country-stl" class="plot-box tall"></div>
       </section>
       <section class="group-card" data-subtab="vol">
-        <h3>4) Volatilite ve Bollinger</h3>
         <div id="chart-country-vol" class="plot-box tall"></div>
       </section>
       <section class="group-card" data-subtab="forecast">
-        <h3>5) Forecast</h3>
         <div id="chart-country-forecast" class="plot-box"></div>
       </section>
       <section class="group-card" data-subtab="corr">
-        <h3>6) Ulkeler Arasi Korelasyon</h3>
         <div id="chart-country-corr" class="plot-box"></div>
       </section>
       <div class="grid-2">
-        <article>
-          <h3>Related Queries</h3>
-          <div class="table-wrap small-table"><table id="related-queries-top"><thead><tr><th>Query</th><th>Value</th></tr></thead><tbody></tbody></table></div>
-          <div class="table-wrap small-table"><table id="related-queries-rising"><thead><tr><th>Query</th><th>Value</th></tr></thead><tbody></tbody></table></div>
-        </article>
-        <article>
-          <h3>Related Topics</h3>
-          <div class="table-wrap small-table"><table id="related-topics-top"><thead><tr><th>Topic</th><th>Value</th></tr></thead><tbody></tbody></table></div>
-          <div class="table-wrap small-table"><table id="related-topics-rising"><thead><tr><th>Topic</th><th>Value</th></tr></thead><tbody></tbody></table></div>
-        </article>
       </div>
     </article>
   </section>
@@ -159,9 +108,11 @@
           <select id="city-country-select"></select>
           <label>Sehir</label>
           <select id="city-select"></select>
+          <button id="download-city-timeline-btn" class="btn">Sehir Zaman Serisini Cek</button>
         </div>
       </div>
       <section class="metrics metrics-5" id="city-metrics"></section>
+      <p id="city-status-note" class="inline-note"></p>
       <div class="grid-2">
         <div id="chart-city-trend" class="plot-box"></div>
         <div class="table-wrap"><table id="city-ranking-table"><thead><tr><th>Rank</th><th>Sehir</th><th>Skor</th><th>Geo</th></tr></thead><tbody></tbody></table></div>
@@ -234,7 +185,7 @@
       <label>Keyword veya Topic ID</label>
       <input id="ws-keyword" value="/m/02vqb5x" required />
 
-      <label>Ulkeler (CC, virgulle)</label>
+      <label>Ulkeler (CC, virgul/bosluk/satir sonu)</label>
       <input id="ws-countries" placeholder="TR,US,DE" value="TR,US,DE" />
 
       <label class="inline-check">

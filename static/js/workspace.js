@@ -48,6 +48,15 @@ function parseCountryKeywordsText(rawText) {
   return out;
 }
 
+function parseCountriesInput(rawText) {
+  const tokens = String(rawText || "")
+    .toUpperCase()
+    .split(/[\s,;]+/)
+    .map((item) => item.trim())
+    .filter((item) => /^[A-Z]{2}$/.test(item));
+  return Array.from(new Set(tokens));
+}
+
 function formatCountryKeywords(map) {
   const obj = map || {};
   return Object.keys(obj)
@@ -60,6 +69,38 @@ function workspaceCardLabel(ws) {
   const modeLabel = ws.use_topic_mode ? "Google Topic ID modu" : "Keyword modu";
   const keywordCount = Object.keys(ws.country_keywords || {}).length;
   return `${modeLabel} · ${keywordCount} ulke kural`;
+}
+
+async function startWorkspaceFetch(workspaceId) {
+  const workspace = state.workspaces.find((item) => item.id === workspaceId);
+  const workspaceName = workspace?.name || workspaceId;
+
+  try {
+    const res = await fetch("/api/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    });
+    const payload = await res.json();
+
+    if (!res.ok) {
+      if (res.status === 409 && payload.job) {
+        const activeWorkspaceId = payload.job.workspace_id || "bilinmiyor";
+        const activeStatus = payload.job.status || "running";
+        if (activeWorkspaceId === workspaceId) {
+          notify(`${workspaceName} icin veri cekimi zaten calisiyor (${activeStatus})`);
+        } else {
+          notify(`Su anda baska bir workspace icin cekim calisiyor: ${activeWorkspaceId} (${activeStatus})`);
+        }
+        return;
+      }
+      throw new Error(payload.detail || "Fetch error");
+    }
+
+    notify(`${workspaceName} icin veri cekimi baslatildi`);
+  } catch (error) {
+    notify(`Hata: ${error.message}`);
+  }
 }
 
 function applyTheme(theme) {
@@ -100,6 +141,7 @@ function card(ws) {
         <div class="ws-menu-wrap">
           <button class="ws-menu-btn" data-action="menu" data-id="${ws.id}" title="Menu">⋯</button>
           <div class="ws-menu" id="menu-${ws.id}">
+            <button data-action="fetch" data-id="${ws.id}">Veri Cek</button>
             <button data-action="default" data-id="${ws.id}">Varsayilan Yap</button>
             <button data-action="edit" data-id="${ws.id}">Duzenle</button>
             <button data-action="delete" data-id="${ws.id}">Sil</button>
@@ -114,7 +156,7 @@ function card(ws) {
         <div class="ws-kpi"><p>Ortalama</p><b>${avg}</b></div>
       </div>
       <div class="ws-actions">
-        <a class="btn btn-primary" href="/dashboard?ws=${ws.id}">Sec ve Ac</a>
+        <a class="btn btn-primary" href="/dashboard?ws=${ws.id}">Aç</a>
       </div>
     </article>
   `;
@@ -164,12 +206,12 @@ async function saveForm(event) {
   const id = inputId.value.trim();
   const name = inputName.value.trim();
   const keyword = inputKeyword.value.trim();
-  const countries = inputCountries.value.split(",").map((x) => x.trim().toUpperCase()).filter(Boolean);
+  const countries = parseCountriesInput(inputCountries.value || "");
   const useTopicMode = Boolean(inputTopicMode?.checked);
   const countryKeywords = parseCountryKeywordsText(inputCountryKeywords?.value || "");
 
   if (!name || !keyword || !countries.length) {
-    notify("Tum alanlar zorunlu");
+    notify("En az bir gecerli ulke kodu girin (orn: TR,US,DE)");
     return;
   }
 
@@ -184,7 +226,7 @@ async function saveForm(event) {
     });
     const responsePayload = await res.json();
     if (!res.ok) {
-      notify("Olusturma hatasi");
+      notify(responsePayload?.detail || "Olusturma hatasi");
       return;
     }
     savedWorkspaceId = responsePayload?.item?.id || savedWorkspaceId;
@@ -195,9 +237,9 @@ async function saveForm(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    await res.json();
+    const responsePayload = await res.json();
     if (!res.ok) {
-      notify("Guncelleme hatasi");
+      notify(responsePayload?.detail || "Guncelleme hatasi");
       return;
     }
     notify("Workspace guncellendi");
@@ -269,9 +311,13 @@ grid.addEventListener("click", async (event) => {
     return;
   }
 
+  if (action === "fetch" && ws) await startWorkspaceFetch(id);
   if (action === "edit" && ws) openEdit(ws);
   if (action === "default") await setDefault(id);
   if (action === "delete") await removeWorkspace(id);
+
+  const menu = document.getElementById(`menu-${id}`);
+  if (menu) menu.classList.remove("open");
 });
 
 document.addEventListener("click", (event) => {

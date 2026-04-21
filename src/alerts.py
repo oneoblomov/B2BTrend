@@ -124,7 +124,7 @@ def send_telegram(message: str) -> bool:
             await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
 
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 pool.submit(asyncio.run, _send()).result(timeout=15)

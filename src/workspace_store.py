@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,11 @@ WORKSPACES_DIR = DATA_DIR / "workspaces"
 DATASET_FILE = "dataset.csv"
 META_FILE = "metadata.json"
 SETTINGS_FILE = WORKSPACES_DIR / "settings.json"
+FILE_LOCK = threading.RLock()
+
+
+class WorkspaceValidationError(ValueError):
+    pass
 
 
 def _slugify(text: str) -> str:
@@ -37,10 +44,21 @@ def workspace_meta_path(workspace_id: str) -> Path:
     return _workspace_dir(workspace_id) / META_FILE
 
 
-def _normalize_countries(countries: list[str] | None) -> list[str]:
-    values = [str(item).strip().upper() for item in (countries or []) if str(item).strip()]
-    unique_sorted = sorted(set(values))
-    return unique_sorted or list(TOP_20_COUNTRIES)
+def _normalize_countries(countries: list[str] | None, fallback: list[str] | None = None) -> list[str]:
+    clean: list[str] = []
+    seen: set[str] = set()
+    for item in (countries or []):
+        code = str(item).strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}", code):
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        clean.append(code)
+
+    if clean:
+        return clean
+    return list(fallback or [])
 
 
 def _default_meta(workspace_id: str, name: str | None = None) -> dict[str, Any]:
@@ -86,24 +104,59 @@ def set_default_workspace(workspace_id: str) -> None:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    backup = path.with_suffix(path.suffix + ".bak")
+
+    with FILE_LOCK:
+        if not path.exists():
+            return {}
+
+        def _read_target(target: Path) -> dict[str, Any] | None:
+            try:
+                raw_text = target.read_text(encoding="utf-8")
+                text = raw_text.strip()
+                if not text:
+                    return {}
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+                return {}
+            except Exception:
+                return None
+
+        parsed = _read_target(path)
+        if parsed is not None:
+            return parsed
+
+        recovered = _read_target(backup)
+        if recovered is not None:
+            return recovered
+
         return {}
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    serialized = json.dumps(payload, indent=2)
+    backup = path.with_suffix(path.suffix + ".bak")
+
+    with FILE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if path.exists():
+            try:
+                backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            except Exception:
+                pass
+
+        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp.write_text(serialized, encoding="utf-8")
+        os.replace(tmp, path)
 
 
 def _normalize_meta(workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     base = _default_meta(workspace_id, name=payload.get("name"))
     base["language"] = str(payload.get("language") or "tr").strip() or "tr"
     base["keyword"] = str(payload.get("keyword") or DEFAULT_KEYWORD).strip() or DEFAULT_KEYWORD
-    base["countries"] = _normalize_countries(payload.get("countries"))
+    base["countries"] = _normalize_countries(payload.get("countries"), fallback=list(TOP_20_COUNTRIES))
     base["use_topic_mode"] = bool(payload.get("use_topic_mode", False))
 
     raw_country_keywords = payload.get("country_keywords") or {}
@@ -173,7 +226,8 @@ def list_workspaces() -> list[dict[str, Any]]:
 
 
 def load_workspace_meta(workspace_id: str) -> dict[str, Any]:
-    raw = _read_json(workspace_meta_path(workspace_id))
+    path = workspace_meta_path(workspace_id)
+    raw = _read_json(path)
     normalized = _normalize_meta(workspace_id, raw)
 
     data_path = workspace_dataset_path(workspace_id)
@@ -183,7 +237,8 @@ def load_workspace_meta(workspace_id: str) -> dict[str, Any]:
         except Exception:
             normalized["dataset_rows"] = 0
 
-    _write_json(workspace_meta_path(workspace_id), normalized)
+    if raw != normalized:
+        _write_json(path, normalized)
     return normalized
 
 
@@ -199,7 +254,10 @@ def create_workspace(name: str, keyword: str, countries: list[str]) -> dict[str,
 
     meta = _default_meta(workspace_id, name=name.strip() or workspace_id)
     meta["keyword"] = keyword.strip() or DEFAULT_KEYWORD
-    meta["countries"] = _normalize_countries(countries)
+    normalized_countries = _normalize_countries(countries)
+    if not normalized_countries:
+        raise WorkspaceValidationError("En az bir gecerli ulke kodu secilmeli.")
+    meta["countries"] = normalized_countries
     meta["updated_at"] = _now_iso()
 
     _workspace_dir(workspace_id).mkdir(parents=True, exist_ok=True)
@@ -221,7 +279,10 @@ def update_workspace(
     meta["name"] = name.strip() or workspace_id
     meta["language"] = language.strip() or "tr"
     meta["keyword"] = keyword.strip() or DEFAULT_KEYWORD
-    meta["countries"] = _normalize_countries(countries)
+    normalized_countries = _normalize_countries(countries)
+    if not normalized_countries:
+        raise WorkspaceValidationError("En az bir gecerli ulke kodu secilmeli.")
+    meta["countries"] = normalized_countries
     meta["use_topic_mode"] = bool(use_topic_mode)
 
     clean_keywords: dict[str, str] = {}
@@ -312,6 +373,8 @@ def save_workspace_dataset(
     workspace_dir = _workspace_dir(workspace_id)
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
+    existing_cities, existing_timeline = load_workspace_dataset(workspace_id)
+
     city_rows = cities_df.copy()
     timeline_rows = timeline_df.copy()
 
@@ -332,8 +395,22 @@ def save_workspace_dataset(
     timeline_rows["date"] = timeline_rows["date"].dt.strftime("%Y-%m-%d")
     timeline_rows["row_type"] = "timeline"
 
+    if not existing_cities.empty:
+        existing_city_rows = existing_cities.copy()
+        existing_city_rows["date"] = pd.NA
+        existing_city_rows["row_type"] = "city"
+        city_rows = pd.concat([existing_city_rows[["country", "city", "geo_code", "score", "date", "row_type"]], city_rows], ignore_index=True)
+
+    if not existing_timeline.empty:
+        existing_timeline_rows = existing_timeline.copy()
+        existing_timeline_rows = existing_timeline_rows[["country", "city", "geo_code", "date", "score"]]
+        existing_timeline_rows["date"] = pd.to_datetime(existing_timeline_rows["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        existing_timeline_rows["row_type"] = "timeline"
+        timeline_rows = pd.concat([existing_timeline_rows[["country", "city", "geo_code", "date", "score", "row_type"]], timeline_rows], ignore_index=True)
+
     combined = pd.concat([city_rows, timeline_rows], ignore_index=True)
     combined = combined[["row_type", "country", "city", "geo_code", "date", "score"]]
+    combined = combined.drop_duplicates(subset=["row_type", "country", "city", "geo_code", "date"], keep="last").reset_index(drop=True)
     dataset_path = workspace_dataset_path(workspace_id)
     combined.to_csv(dataset_path, index=False)
 

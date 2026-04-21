@@ -29,6 +29,7 @@
     socket: null,
     reconnectTimer: null,
     pollTimer: null,
+    notificationTicker: null,
     lastSignature: "",
     notifications: loadNotifications(),
     panelOpen: false,
@@ -102,6 +103,14 @@
     return `Tahmini kalan: ${formatDuration(remainingMs)}`;
   }
 
+  function remainingDurationText(job) {
+    const remainingMs = estimateRemainingMs(job);
+    if (remainingMs == null) {
+      return "";
+    }
+    return formatDuration(remainingMs);
+  }
+
   function jobFromSnapshot(snapshot) {
     if (!snapshot) return null;
     return snapshot.active || snapshot.latest || null;
@@ -159,6 +168,9 @@
       status,
       workspace_id: String(item.workspace_id || ""),
       progress: Number.isFinite(Number(item.progress)) ? clamp(Number(item.progress), 0, 1) : null,
+      started_at: String(item.started_at || ""),
+      completed: Number.isFinite(Number(item.completed)) ? Number(item.completed) : null,
+      total: Number.isFinite(Number(item.total)) ? Number(item.total) : null,
       active: Boolean(item.active),
       seen: Boolean(item.seen),
       timestamp,
@@ -198,6 +210,37 @@
     return "Bilgi";
   }
 
+  function notificationProgress(item) {
+    if (!item) {
+      return null;
+    }
+    if (Number.isFinite(Number(item.progress))) {
+      return clamp(Number(item.progress), 0, 1);
+    }
+    const total = Number(item.total || 0);
+    const completed = Number(item.completed || 0);
+    if (total > 0) {
+      return clamp(completed / total, 0, 1);
+    }
+    return null;
+  }
+
+  function refreshNotificationTicker() {
+    const hasActive = state.notifications.some((item) => item.active && ACTIVE_STATUSES.has(item.status));
+    if (hasActive && !state.notificationTicker) {
+      state.notificationTicker = window.setInterval(() => {
+        if (state.panelOpen) {
+          renderNotifications();
+        }
+      }, 1000);
+      return;
+    }
+    if (!hasActive && state.notificationTicker) {
+      window.clearInterval(state.notificationTicker);
+      state.notificationTicker = null;
+    }
+  }
+
   function renderNotifications() {
     if (els.notificationCount) {
       const count = notificationCount();
@@ -217,9 +260,15 @@
 
     els.notificationList.innerHTML = items
       .map((item) => {
-        const progress = Number.isFinite(Number(item.progress)) ? clamp(Number(item.progress), 0, 1) : null;
+        const progress = notificationProgress(item);
         const percent = progress == null ? null : Math.round(progress * 100);
-        const showProgress = item.active && percent != null;
+        const active = Boolean(item.active && ACTIVE_STATUSES.has(item.status));
+        const showProgress = percent != null && (active || FINAL_STATUSES.has(item.status));
+        const remaining = active ? remainingDurationText(item) : "";
+        const stepMeta = Number(item.total || 0) > 0 && Number.isFinite(Number(item.completed))
+          ? `${Math.min(Number(item.completed), Number(item.total))}/${Number(item.total)} adim`
+          : "";
+        const statusLabel = jobStatusLabel(item);
         const cancelable = item.active && item.job_id && ACTIVE_STATUSES.has(item.status) && item.status !== "cancelling";
 
         return `
@@ -230,12 +279,16 @@
             </div>
             <h4 class="notification-item__title">${escapeHtml(item.title)}</h4>
             <p class="notification-item__message">${escapeHtml(item.message)}</p>
+            <p class="notification-item__meta">${escapeHtml(statusLabel)}${stepMeta ? ` · ${escapeHtml(stepMeta)}` : ""}${remaining ? ` · Kalan: ${escapeHtml(remaining)}` : ""}</p>
+            ${showProgress ? `<div class="notification-item__progress-meta"><span>${percent}%</span>${remaining ? `<span>${escapeHtml(remaining)}</span>` : ""}</div>` : ""}
             ${showProgress ? `<div class="notification-item__progress" aria-hidden="true"><span style="width:${percent}%"></span></div>` : ""}
             ${cancelable ? `<div class="notification-item__actions"><button type="button" class="btn btn-compact notification-item__cancel" data-cancel-job="${escapeHtml(item.job_id)}">Iptal Et</button></div>` : ""}
           </article>
         `;
       })
       .join("");
+
+    refreshNotificationTicker();
   }
 
   function setPanelOpen(open) {
@@ -337,6 +390,9 @@
       status: job.status,
       workspace_id: job.workspace_id,
       progress: jobProgress(job),
+      started_at: job.started_at || "",
+      completed: Number.isFinite(Number(job.completed)) ? Number(job.completed) : null,
+      total: Number.isFinite(Number(job.total)) ? Number(job.total) : null,
       active,
       seen: false,
       timestamp: job.started_at || job.created_at || new Date().toISOString(),
@@ -384,8 +440,6 @@
   }
 
   function render(job) {
-    if (!els.dock) return;
-
     const currentJob = job;
     let status = currentJob?.status || "idle";
     const progress = jobProgress(currentJob);
@@ -405,64 +459,66 @@
     const completed = currentJob && status === "completed";
     const cancelled = currentJob && status === "cancelled";
 
-    els.dock.dataset.state = running ? status : completed ? "completed" : failed ? "failed" : cancelled ? "cancelled" : "idle";
-    els.dock.classList.toggle("is-running", running);
-    els.dock.classList.toggle("is-cancelling", cancelling);
-    els.dock.classList.toggle("is-complete", completed);
-    els.dock.classList.toggle("is-failed", failed);
-    els.dock.classList.toggle("is-cancelled", cancelled);
-    els.dock.classList.toggle("is-idle", !currentJob);
+    if (els.dock) {
+      els.dock.dataset.state = running ? status : completed ? "completed" : failed ? "failed" : cancelled ? "cancelled" : "idle";
+      els.dock.classList.toggle("is-running", running);
+      els.dock.classList.toggle("is-cancelling", cancelling);
+      els.dock.classList.toggle("is-complete", completed);
+      els.dock.classList.toggle("is-failed", failed);
+      els.dock.classList.toggle("is-cancelled", cancelled);
+      els.dock.classList.toggle("is-idle", !currentJob);
 
-    if (els.badge) {
-      els.badge.textContent = running ? (cancelling ? "Iptal" : "Calisiyor") : completed ? "Tamamlandi" : failed ? "Hata" : cancelled ? "Iptal" : "Hazir";
-    }
-
-    if (els.label) {
-      if (!currentJob) {
-        els.label.textContent = "Arkaplan veri cekimi yok";
-      } else if (running) {
-        els.label.textContent = currentJob.message || (cancelling ? "Veri cekimi iptal ediliyor" : "Veri cekimi devam ediyor");
-      } else if (completed) {
-        els.label.textContent = currentJob.message || "Veri cekimi tamamlandi";
-      } else if (failed) {
-        els.label.textContent = currentJob.message || "Veri cekimi basarisiz";
-      } else if (cancelled) {
-        els.label.textContent = currentJob.message || "Veri cekimi iptal edildi";
-      } else {
-        els.label.textContent = currentJob.message || currentJob.phase || "Durum izleniyor";
+      if (els.badge) {
+        els.badge.textContent = running ? (cancelling ? "Iptal" : "Calisiyor") : completed ? "Tamamlandi" : failed ? "Hata" : cancelled ? "Iptal" : "Hazir";
       }
-    }
 
-    if (els.status) {
-      const remaining = running && !cancelling ? formatRemaining(currentJob) : "";
-      if (cancelling) {
-        els.status.textContent = "Iptal ediliyor";
-      } else {
-        els.status.textContent = running
-          ? remaining
-            ? `${percent}% · ${remaining}`
-            : `${percent}%`
-          : completed
-            ? "Hazir"
-            : failed
-              ? "Kontrol gerekli"
-              : cancelled
-                ? "Iptal edildi"
-                : "Takip aktif";
+      if (els.label) {
+        if (!currentJob) {
+          els.label.textContent = "Arkaplan veri cekimi yok";
+        } else if (running) {
+          els.label.textContent = currentJob.message || (cancelling ? "Veri cekimi iptal ediliyor" : "Veri cekimi devam ediyor");
+        } else if (completed) {
+          els.label.textContent = currentJob.message || "Veri cekimi tamamlandi";
+        } else if (failed) {
+          els.label.textContent = currentJob.message || "Veri cekimi basarisiz";
+        } else if (cancelled) {
+          els.label.textContent = currentJob.message || "Veri cekimi iptal edildi";
+        } else {
+          els.label.textContent = currentJob.message || currentJob.phase || "Durum izleniyor";
+        }
       }
-    }
 
-    if (els.cancelBtn) {
-      const allowCancel = running && !cancelling && !completed && !failed && !cancelled;
-      els.cancelBtn.hidden = !allowCancel;
-      els.cancelBtn.disabled = !allowCancel;
-      if (allowCancel) {
-        els.cancelBtn.textContent = "Iptal Et";
+      if (els.status) {
+        const remaining = running && !cancelling ? formatRemaining(currentJob) : "";
+        if (cancelling) {
+          els.status.textContent = "Iptal ediliyor";
+        } else {
+          els.status.textContent = running
+            ? remaining
+              ? `${percent}% · ${remaining}`
+              : `${percent}%`
+            : completed
+              ? "Hazir"
+              : failed
+                ? "Kontrol gerekli"
+                : cancelled
+                  ? "Iptal edildi"
+                  : "Takip aktif";
+        }
       }
-    }
 
-    if (els.meta) {
-      els.meta.textContent = formatMeta(currentJob);
+      if (els.cancelBtn) {
+        const allowCancel = running && !cancelling && !completed && !failed && !cancelled;
+        els.cancelBtn.hidden = !allowCancel;
+        els.cancelBtn.disabled = !allowCancel;
+        if (allowCancel) {
+          els.cancelBtn.textContent = "Iptal Et";
+        }
+      }
+
+      if (els.meta) {
+        els.meta.textContent = formatMeta(currentJob);
+      }
     }
 
     if (els.localDot) {

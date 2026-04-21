@@ -113,6 +113,8 @@ class FetchJobStore:
         normalized["workspace_id"] = str(normalized.get("workspace_id") or "")
         normalized["job_id"] = str(normalized.get("job_id") or "")
         normalized["cancel_requested"] = bool(normalized.get("cancel_requested") or False)
+        normalized["resume_requested"] = bool(normalized.get("resume_requested") or False)
+        normalized["resume_enabled"] = bool(normalized.get("resume_enabled") or False)
         return normalized
 
     def snapshot(self) -> dict[str, Any]:
@@ -140,6 +142,7 @@ class FetchJobStore:
         use_topic_mode: bool,
         language: str,
         country_keywords: dict[str, str],
+        resume_requested: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             state = self._read_state()
@@ -171,6 +174,8 @@ class FetchJobStore:
                 "result": None,
                 "error": None,
                 "cancel_requested": False,
+                "resume_requested": bool(resume_requested),
+                "resume_enabled": False,
             }
             state["active"] = deepcopy(job)
             state["latest"] = deepcopy(job)
@@ -194,6 +199,9 @@ class FetchJobStore:
 
             if job is None:
                 return None
+
+            if job.get("status") in FINAL_STATUSES:
+                return deepcopy(job)
 
             for key, value in changes.items():
                 job[key] = value
@@ -225,11 +233,12 @@ class FetchJobStore:
 
             now = self._now()
             active["cancel_requested"] = True
-            active["status"] = "cancelling"
-            active["phase"] = "cancelling"
-            active["message"] = "Veri cekimi iptal ediliyor"
+            active["status"] = "cancelled"
+            active["phase"] = "cancelled"
+            active["message"] = "Veri cekimi iptal edildi"
             active["updated_at"] = now
-            state["active"] = deepcopy(active)
+            active["finished_at"] = now
+            state["active"] = None
             state["latest"] = deepcopy(active)
             state["updated_at"] = now
             self._write_state(state)

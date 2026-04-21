@@ -33,6 +33,10 @@ const state = {
   activeTab: "tab-map",
   activeSubTab: "overview",
   lastCompletedJobId: "",
+  charts: {},
+  cityLoadSeq: 0,
+  cityRankingRows: [],
+  selectedGeoCode: "",
 };
 
 const el = {
@@ -57,6 +61,7 @@ const el = {
   countryAnalysisSelect: document.getElementById("country-analysis-select"),
   cityCountrySelect: document.getElementById("city-country-select"),
   citySelect: document.getElementById("city-select"),
+  downloadCityTimelineBtn: document.getElementById("download-city-timeline-btn"),
   hourlyCountrySelect: document.getElementById("hourly-country-select"),
   compareInput: document.getElementById("compare-input"),
   rawSearchInput: document.getElementById("raw-search-input"),
@@ -68,6 +73,7 @@ const el = {
   downloadTimelineBtn: document.getElementById("download-timeline-btn"),
   countryMetrics: document.getElementById("country-metrics"),
   cityMetrics: document.getElementById("city-metrics"),
+  cityStatusNote: document.getElementById("city-status-note"),
   hourlyBestHours: document.getElementById("hourly-best-hours"),
 };
 
@@ -84,6 +90,13 @@ function setFetchButtonState(isBusy, label) {
   if (!el.fetchBtn) return;
   el.fetchBtn.disabled = Boolean(isBusy);
   el.fetchBtn.textContent = label || (isBusy ? "Cekiliyor..." : "Veri Cek");
+}
+
+function setCityTimelineButtonState(isBusy, forceDisabled = false) {
+  if (!el.downloadCityTimelineBtn) return;
+  const hasSelection = Boolean(state.selectedWorkspaceId && state.selectedCountry && state.selectedCity);
+  el.downloadCityTimelineBtn.disabled = Boolean(isBusy || forceDisabled || !hasSelection);
+  el.downloadCityTimelineBtn.textContent = isBusy ? "Sehir Zaman Serisi Cekiliyor..." : "Sehir Zaman Serisini Cek";
 }
 
 function metricCard(label, value) {
@@ -126,9 +139,16 @@ function clearDashboardPanels() {
   renderTable("#city-ranking-table", [], ["rank", "city", "score", "geo_code"]);
   renderTable("#raw-city-table", [], ["country", "city", "geo_code", "score"]);
   renderTable("#raw-timeline-table", [], ["country", "city", "date", "score"]);
+  setSelectOptions(el.citySelect, [], (x) => x, (x) => x, "");
 
   if (el.countryMetrics) el.countryMetrics.innerHTML = "";
   if (el.cityMetrics) el.cityMetrics.innerHTML = "";
+  if (el.cityStatusNote) el.cityStatusNote.textContent = "";
+  state.selectedCity = "";
+  state.selectedGeoCode = "";
+  state.cityRankingRows = [];
+  state.cityLoadSeq += 1;
+  setCityTimelineButtonState(false, true);
   if (el.hourlyBestHours) el.hourlyBestHours.textContent = "";
 }
 
@@ -164,21 +184,27 @@ function renderTable(tbodyId, rows, cols) {
 function plot(targetId, fig) {
   const target = document.getElementById(targetId);
   if (!target) return;
+
   if (!fig || !fig.data) {
+    state.charts[targetId] = null;
     target.innerHTML = "<p class='inline-note'>Veri yok</p>";
     return;
   }
+
+  state.charts[targetId] = fig;
 
   const currentTheme = document.body.getAttribute("data-theme") || "system";
   const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
   const darkMode = currentTheme === "dark" || (currentTheme === "system" && prefersDark);
 
-  const rootStyles = getComputedStyle(document.documentElement);
+  const rootStyles = getComputedStyle(document.body);
   const textColor = rootStyles.getPropertyValue("--ink").trim() || (darkMode ? "#edf2fb" : "#101329");
   const lineColor = rootStyles.getPropertyValue("--line").trim() || (darkMode ? "#2d3748" : "#d7e6e2");
   const paperColor = rootStyles.getPropertyValue("--paper").trim() || (darkMode ? "#1a1f26" : "#ffffff");
 
+  const isMobile = window.innerWidth <= 720;
   const layout = Object.assign({}, fig.layout || {}, {
+    autosize: true,
     plot_bgcolor: paperColor,
     paper_bgcolor: paperColor,
     font: Object.assign({}, (fig.layout || {}).font || {}, { color: textColor }),
@@ -194,13 +220,123 @@ function plot(targetId, fig) {
     }),
     legend: Object.assign({}, (fig.layout || {}).legend || {}, {
       font: Object.assign({}, ((fig.layout || {}).legend || {}).font || {}, { color: textColor }),
+      orientation: isMobile ? "h" : ((fig.layout || {}).legend || {}).orientation,
+      x: isMobile ? 0.5 : ((fig.layout || {}).legend || {}).x,
+      xanchor: isMobile ? "center" : ((fig.layout || {}).legend || {}).xanchor,
+      y: isMobile ? -0.22 : ((fig.layout || {}).legend || {}).y,
+      yanchor: isMobile ? "top" : ((fig.layout || {}).legend || {}).yanchor,
     }),
   });
 
-  Plotly.react(target, fig.data, layout, {
+  if (isMobile) {
+    layout.margin = Object.assign({}, layout.margin || {}, {
+      b: Math.max((layout.margin || {}).b || 0, 120),
+    });
+  }
+
+  const plotData = (fig.data || []).map((trace) => {
+    if (!trace) return trace;
+    const newTrace = Object.assign({}, trace);
+    if (trace.colorbar) {
+      newTrace.colorbar = Object.assign({}, trace.colorbar, {
+        thickness: 10,
+        thicknessmode: "pixels",
+        ...(isMobile ? {
+          orientation: "h",
+          x: 0.5,
+          xanchor: "center",
+          y: -0.15,
+          yanchor: "top",
+          len: 0.8,
+        } : {}),
+      });
+    }
+    if (trace.marker && trace.marker.colorbar) {
+      newTrace.marker = Object.assign({}, trace.marker, {
+        colorbar: Object.assign({}, trace.marker.colorbar, {
+          thickness: 10,
+          thicknessmode: "pixels",
+          ...(isMobile ? {
+            orientation: "h",
+            x: 0.5,
+            xanchor: "center",
+            y: -0.15,
+            yanchor: "top",
+            len: 0.8,
+          } : {}),
+        }),
+      });
+    }
+    return newTrace;
+  });
+
+  if (isMobile && layout.coloraxis && layout.coloraxis.colorbar) {
+    layout.coloraxis = Object.assign({}, layout.coloraxis, {
+      colorbar: Object.assign({}, layout.coloraxis.colorbar, {
+        thickness: 10,
+        thicknessmode: "pixels",
+        orientation: "h",
+        x: 0.5,
+        xanchor: "center",
+        y: -0.15,
+        yanchor: "top",
+        len: 0.8,
+      }),
+    });
+  }
+
+  // Map, geo choropleth için koyu/aydın tema uyumu
+  const hasMapboxTrace = (fig.data || []).some((trace) => {
+    const type = String(trace.type || "").toLowerCase();
+    const subplot = String(trace.subplot || "").toLowerCase();
+    return [
+      "scattermapbox",
+      "scattermap",
+      "choroplethmapbox",
+      "densitymapbox",
+      "heatmapmapbox",
+    ].includes(type) || subplot.startsWith("mapbox");
+  });
+
+  if (hasMapboxTrace || layout.mapbox || (fig.layout || {}).mapbox) {
+    layout.mapbox = Object.assign({}, (fig.layout || {}).mapbox || {}, {
+      style: darkMode ? "carto-darkmatter" : "carto-positron",
+      center: (fig.layout || {}).mapbox?.center || undefined,
+      zoom: (fig.layout || {}).mapbox?.zoom || undefined,
+    });
+  }
+
+  if (hasMapboxTrace || layout.map || (fig.layout || {}).map) {
+    layout.map = Object.assign({}, (fig.layout || {}).map || {}, {
+      style: darkMode ? "carto-darkmatter" : "carto-positron",
+      center: (fig.layout || {}).map?.center || undefined,
+      zoom: (fig.layout || {}).map?.zoom || undefined,
+    });
+  }
+
+  if (layout.geo || (fig.layout || {}).geo) {
+    layout.geo = Object.assign({}, (fig.layout || {}).geo || {}, {
+      bg_color: paperColor,
+      bgcolor: paperColor,
+      showland: true,
+      landcolor: darkMode ? "#0f1419" : "#f7fbff",
+      lakecolor: darkMode ? "#151b23" : "#deebf7",
+      subunitcolor: lineColor,
+      countrycolor: lineColor,
+    });
+  }
+
+  Plotly.react(target, plotData, layout, {
     responsive: true,
     displaylogo: false,
     modeBarButtonsToRemove: ["select2d", "lasso2d"],
+  });
+}
+
+function syncChartTheme() {
+  Object.entries(state.charts || {}).forEach(([targetId, fig]) => {
+    if (!fig || !fig.data) return;
+    plot(targetId, fig);
   });
 }
 
@@ -225,6 +361,24 @@ function parseCountryKeywordsText(rawText) {
   return out;
 }
 
+function parseCountriesInput(rawText) {
+  const tokens = String(rawText || "")
+    .toUpperCase()
+    .split(/[\s,;]+/)
+    .map((item) => item.trim())
+    .filter((item) => /^[A-Z]{2}$/.test(item));
+  return Array.from(new Set(tokens));
+}
+
+const prefersColorScheme = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+
+function handleSystemThemeChange(event) {
+  const currentTheme = document.body.getAttribute("data-theme") || "system";
+  if (currentTheme === "system") {
+    syncChartTheme();
+  }
+}
+
 function applyTheme(theme) {
   document.body.setAttribute("data-theme", theme);
 
@@ -233,11 +387,22 @@ function applyTheme(theme) {
       btn.classList.toggle("is-active", btn.dataset.theme === theme);
     });
   }
+
+  // Temayı değiştirdiğinde aktif Plotly grafikleri yeniden çizerek güncel renkleri uygula
+  syncChartTheme();
 }
 
 function initTheme() {
   const saved = localStorage.getItem(THEME_KEY) || "system";
   applyTheme(saved);
+
+  if (prefersColorScheme) {
+    if (typeof prefersColorScheme.addEventListener === "function") {
+      prefersColorScheme.addEventListener("change", handleSystemThemeChange);
+    } else if (typeof prefersColorScheme.addListener === "function") {
+      prefersColorScheme.addListener(handleSystemThemeChange);
+    }
+  }
 }
 
 function toggleCountryKeywordInput() {
@@ -257,10 +422,14 @@ function readUrlState() {
   const tab = p.get("tab");
   const ws = p.get("ws");
   const country = p.get("country");
+  const city = p.get("city");
+  const geo = p.get("geo");
   const subtab = p.get("subtab");
   if (tab) state.activeTab = tab;
   if (ws) state.selectedWorkspaceId = ws;
   if (country) state.selectedCountry = country;
+  if (city) state.selectedCity = city;
+  if (geo) state.selectedGeoCode = geo;
   if (subtab) state.activeSubTab = subtab;
 }
 
@@ -269,6 +438,8 @@ function writeUrlState() {
   p.set("tab", state.activeTab);
   if (state.selectedWorkspaceId) p.set("ws", state.selectedWorkspaceId);
   if (state.selectedCountry) p.set("country", state.selectedCountry);
+  if (state.selectedCity) p.set("city", state.selectedCity);
+  if (state.selectedGeoCode) p.set("geo", state.selectedGeoCode);
   if (state.activeSubTab && state.activeSubTab !== "overview") p.set("subtab", state.activeSubTab);
   const newUrl = `${window.location.pathname}?${p.toString()}`;
   window.history.replaceState({}, "", newUrl);
@@ -342,11 +513,11 @@ async function loadOverview() {
   renderTable("#drill-table", payload.charts.drill_table || [], ["city", "score", "geo_code"]);
   bindWorldMapClick();
   writeUrlState();
+  setTimeout(resizeVisibleCharts, 0);
 
-  await Promise.all([
+  await Promise.allSettled([
     loadCountryAnalysis(),
     loadCityAnalysis(),
-    loadHourly(),
     loadRanking(),
     loadRaw(),
     loadRelated(),
@@ -382,7 +553,11 @@ async function loadCountryAnalysis() {
     range: state.range,
   });
 
-  if (!payload.has_data) return;
+  if (!payload.has_data) {
+    if (el.cityStatusNote) el.cityStatusNote.textContent = payload.message || "Sehir skoru verisi yok";
+    setCityTimelineButtonState(false, true);
+    return;
+  }
 
   const s = payload.stats || {};
   const sig = s.signal || {};
@@ -403,21 +578,53 @@ async function loadCountryAnalysis() {
   plot("chart-country-vol", payload.charts.volatility);
   plot("chart-country-forecast", payload.charts.forecast);
   plot("chart-country-corr", payload.charts.correlation);
+  setTimeout(resizeVisibleCharts, 0);
 }
 
 async function loadCityAnalysis() {
   if (!state.selectedCountry) return;
+  const requestId = ++state.cityLoadSeq;
   const payload = await getJSON("/api/dashboard/city", {
     workspace_id: state.selectedWorkspaceId,
     country: state.selectedCountry,
     city: state.selectedCity,
+    geo_code: state.selectedGeoCode,
     range: state.range,
   });
+
+  if (requestId !== state.cityLoadSeq) return;
 
   if (!payload.has_data) return;
 
   state.selectedCity = payload.city || "";
+  state.selectedGeoCode = payload.geo_code || state.selectedGeoCode || "";
+  state.cityRankingRows = payload.ranking || [];
   setSelectOptions(el.citySelect, payload.city_options || [], (x) => x, (x) => x, state.selectedCity);
+  writeUrlState();
+  setCityTimelineButtonState(false);
+
+  const rankingRows = state.cityRankingRows;
+  const selectedRow = rankingRows.find((row) => row.city === state.selectedCity) || rankingRows[0] || {};
+  const timelineReady = Boolean(payload.timeline_ready);
+
+  if (el.cityStatusNote) {
+    el.cityStatusNote.textContent = payload.message || (timelineReady ? "" : "Sehir zaman serisi manuel olarak indirilmelidir.");
+  }
+
+  if (!timelineReady) {
+    el.cityMetrics.innerHTML = [
+      metricCard("Durum", "Zaman serisi bekleniyor"),
+      metricCard("Skor", selectedRow.score ?? 0),
+      metricCard("Geo", selectedRow.geo_code || payload.geo_code || "-"),
+      metricCard("Rank", selectedRow.rank ?? "-"),
+      metricCard("Sehir", state.selectedCity || "-"),
+    ].join("");
+
+    plot("chart-city-trend", null);
+    renderTable("#city-ranking-table", rankingRows, ["rank", "city", "score", "geo_code"]);
+    setTimeout(resizeVisibleCharts, 0);
+    return;
+  }
 
   const stats = payload.stats || {};
   const sig = stats.signal || {};
@@ -433,7 +640,50 @@ async function loadCityAnalysis() {
   ].join("");
 
   plot("chart-city-trend", payload.charts.city_trend);
-  renderTable("#city-ranking-table", payload.ranking || [], ["rank", "city", "score", "geo_code"]);
+  renderTable("#city-ranking-table", rankingRows, ["rank", "city", "score", "geo_code"]);
+  setTimeout(resizeVisibleCharts, 0);
+}
+
+async function fetchCityTimeline() {
+  if (!state.selectedWorkspaceId || !state.selectedCountry || !state.selectedCity) {
+    notify("Once ulke ve sehir secin", "warning", false);
+    return;
+  }
+
+  const selectedRow = (state.cityRankingRows || []).find((row) => row.city === state.selectedCity) || null;
+  const geoCode = state.selectedGeoCode || selectedRow?.geo_code || "";
+
+  setCityTimelineButtonState(true);
+
+  try {
+    const res = await fetch("/api/fetch/city-timeline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workspace_id: state.selectedWorkspaceId,
+        country: state.selectedCountry,
+        city: state.selectedCity,
+        geo_code: geoCode,
+      }),
+    });
+    const payload = await res.json();
+
+    if (!res.ok) {
+      throw new Error(payload.detail || payload.message || "Sehir zaman serisi cekilemedi");
+    }
+
+    state.selectedCountry = payload.country || state.selectedCountry;
+    state.selectedCity = payload.city || state.selectedCity;
+    state.selectedGeoCode = payload.geo_code || geoCode || state.selectedGeoCode || "";
+    writeUrlState();
+
+    notify(payload.message || "Sehir zaman serisi kaydedildi");
+    await loadOverview();
+  } catch (err) {
+    notify(`Hata: ${err.message}`);
+  } finally {
+    setCityTimelineButtonState(false);
+  }
 }
 
 async function loadHourly() {
@@ -451,6 +701,7 @@ async function loadHourly() {
   el.hourlyBestHours.textContent = payload.best_hours_text || "";
   plot("chart-hourly-avg", payload.charts.avg_hour);
   plot("chart-hourly-heatmap", payload.charts.heatmap);
+  setTimeout(resizeVisibleCharts, 0);
 }
 
 async function loadRanking() {
@@ -464,6 +715,7 @@ async function loadRanking() {
   plot("chart-ranking-rising", payload.charts.rising);
   plot("chart-ranking-falling", payload.charts.falling);
   plot("chart-ranking-compare", payload.charts.compare);
+  setTimeout(resizeVisibleCharts, 0);
 }
 
 async function loadRaw() {
@@ -599,15 +851,12 @@ async function createWorkspaceFromDialog(event) {
 
   const name = document.getElementById("ws-name").value.trim();
   const keyword = document.getElementById("ws-keyword").value.trim();
-  const countries = (document.getElementById("ws-countries").value || "")
-    .split(",")
-    .map((x) => x.trim().toUpperCase())
-    .filter(Boolean);
+  const countries = parseCountriesInput(document.getElementById("ws-countries").value || "");
   const useTopicMode = Boolean(el.wsTopicMode?.checked);
   const countryKeywords = parseCountryKeywordsText(el.wsCountryKeywords?.value || "");
 
   if (!name || !keyword || countries.length === 0) {
-    notify("Tum alanlari doldurun", "warning", false);
+    notify("En az bir gecerli ulke kodu girin (orn: TR,US,DE)", "warning", false);
     return;
   }
 
@@ -619,7 +868,7 @@ async function createWorkspaceFromDialog(event) {
 
   const payload = await res.json();
   if (!res.ok) {
-    notify("Workspace olusturulamadi");
+    notify(payload?.detail || "Workspace olusturulamadi");
     return;
   }
 
@@ -679,47 +928,66 @@ function bindEvents() {
     btn.addEventListener("click", () => activateSubTab(btn.dataset.subtab));
   });
 
-  el.workspaceSelect.addEventListener("change", async (e) => {
-    state.selectedWorkspaceId = e.target.value;
-    localStorage.setItem(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
-    state.selectedCountry = "";
-    state.selectedCity = "";
-    writeUrlState();
-    await loadOverview();
-  });
+  if (el.workspaceSelect) {
+    el.workspaceSelect.addEventListener("change", async (e) => {
+      state.selectedWorkspaceId = e.target.value;
+      localStorage.setItem(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
+      state.selectedCountry = "";
+      state.selectedCity = "";
+      state.selectedGeoCode = "";
+      state.cityRankingRows = [];
+      state.cityLoadSeq += 1;
+      writeUrlState();
+      await loadOverview();
+    });
+  }
 
-  el.rangeSelect.addEventListener("change", async (e) => {
-    state.range = e.target.value;
-    await loadOverview();
-  });
+  if (el.rangeSelect) {
+    el.rangeSelect.addEventListener("change", async (e) => {
+      state.range = e.target.value;
+      await loadOverview();
+    });
+  }
 
   el.mapCountrySelect.addEventListener("change", async (e) => {
     state.selectedCountry = e.target.value;
+    state.selectedCity = "";
+    state.selectedGeoCode = "";
+    state.cityRankingRows = [];
+    state.cityLoadSeq += 1;
     writeUrlState();
     await loadOverview();
   });
 
   el.countryAnalysisSelect.addEventListener("change", async (e) => {
     state.selectedCountry = e.target.value;
+    state.selectedCity = "";
+    state.selectedGeoCode = "";
+    state.cityRankingRows = [];
+    state.cityLoadSeq += 1;
     writeUrlState();
-    await Promise.all([loadCountryAnalysis(), loadRelated(), loadCityAnalysis(), loadHourly()]);
+    await Promise.all([loadCountryAnalysis(), loadRelated(), loadCityAnalysis()]);
   });
 
   el.cityCountrySelect.addEventListener("change", async (e) => {
     state.selectedCountry = e.target.value;
     state.selectedCity = "";
+    state.selectedGeoCode = "";
+    state.cityRankingRows = [];
+    state.cityLoadSeq += 1;
     writeUrlState();
     await loadCityAnalysis();
   });
 
   el.citySelect.addEventListener("change", async (e) => {
     state.selectedCity = e.target.value;
+    state.selectedGeoCode = (state.cityRankingRows || []).find((row) => row.city === state.selectedCity)?.geo_code || "";
+    state.cityLoadSeq += 1;
     await loadCityAnalysis();
   });
 
   el.hourlyCountrySelect.addEventListener("change", async (e) => {
     state.selectedCountry = e.target.value;
-    await loadHourly();
   });
 
   el.mapModeSelect.addEventListener("change", (e) => {
@@ -735,14 +1003,21 @@ function bindEvents() {
     setTimeout(resizeVisibleCharts, 50);
   });
 
-  el.fetchBtn.addEventListener("click", fetchDataset);
-  el.clearCacheBtn.addEventListener("click", clearCache);
-  el.refreshBtn.addEventListener("click", loadOverview);
+  if (el.fetchBtn) {
+    el.fetchBtn.addEventListener("click", () => fetchDataset());
+  }
+  if (el.clearCacheBtn) {
+    el.clearCacheBtn.addEventListener("click", clearCache);
+  }
+  if (el.refreshBtn) {
+    el.refreshBtn.addEventListener("click", loadOverview);
+  }
 
   el.relatedRefreshBtn.addEventListener("click", loadRelated);
   el.hourlyRefreshBtn.addEventListener("click", loadHourly);
   el.rankingRefreshBtn.addEventListener("click", loadRanking);
   el.rawRefreshBtn.addEventListener("click", loadRaw);
+  el.downloadCityTimelineBtn?.addEventListener("click", fetchCityTimeline);
 
   el.downloadCityBtn.addEventListener("click", () => {
     const q = toQuery({ workspace_id: state.selectedWorkspaceId, dataset: "city", range: state.range });
@@ -758,16 +1033,18 @@ function bindEvents() {
     window.open(`/api/export/csv?${q}`, "_blank");
   });
 
-  el.newWorkspaceBtn.addEventListener("click", () => {
-    document.getElementById("ws-id").value = "";
-    document.getElementById("ws-name").value = "";
-    document.getElementById("ws-keyword").value = "/m/02vqb5x";
-    document.getElementById("ws-countries").value = "TR,US,DE";
-    if (el.wsTopicMode) el.wsTopicMode.checked = false;
-    if (el.wsCountryKeywords) el.wsCountryKeywords.value = "";
-    toggleCountryKeywordInput();
-    el.wsDialog.showModal();
-  });
+  if (el.newWorkspaceBtn) {
+    el.newWorkspaceBtn.addEventListener("click", () => {
+      document.getElementById("ws-id").value = "";
+      document.getElementById("ws-name").value = "";
+      document.getElementById("ws-keyword").value = "/m/02vqb5x";
+      document.getElementById("ws-countries").value = "TR,US,DE";
+      if (el.wsTopicMode) el.wsTopicMode.checked = false;
+      if (el.wsCountryKeywords) el.wsCountryKeywords.value = "";
+      toggleCountryKeywordInput();
+      el.wsDialog.showModal();
+    });
+  }
   el.wsCancel.addEventListener("click", () => el.wsDialog.close());
   el.wsTopicMode?.addEventListener("change", toggleCountryKeywordInput);
 
@@ -785,29 +1062,49 @@ function bindEvents() {
 }
 
 (async function bootstrap() {
-  try {
-    initTheme();
-    toggleCountryKeywordInput();
-    readUrlState();
-    const hasWorkspaceQuery = new URLSearchParams(window.location.search).has("ws");
-    if (hasWorkspaceQuery) {
-      state.selectedWorkspaceId = resolveWorkspaceId(state.selectedWorkspaceId);
-    } else {
-      state.selectedWorkspaceId = resolveWorkspaceId(localStorage.getItem(LAST_WORKSPACE_KEY) || "");
-    }
-    bindEvents();
-    window.addEventListener("b2btrend:realtime", handleRealtimeEvent);
-    window.addEventListener("b2btrend:job-state", (event) => {
-      handleJobSnapshot(event.detail?.snapshot || {}, event.detail?.source || "event").catch(() => {});
-    });
-    const initialSnapshot = window.B2BTrendJobStatus?.getSnapshot?.();
-    if (initialSnapshot) {
-      await handleJobSnapshot(initialSnapshot, "bootstrap");
-    }
-    await loadWorkspaces();
-    await loadOverview();
-    activateTab(state.activeTab || "tab-map");
-  } catch (err) {
-    notify(`Baslatma hatasi: ${err.message}`);
+  initTheme();
+  toggleCountryKeywordInput();
+  readUrlState();
+
+  const hasWorkspaceQuery = new URLSearchParams(window.location.search).has("ws");
+  if (hasWorkspaceQuery) {
+    state.selectedWorkspaceId = resolveWorkspaceId(state.selectedWorkspaceId);
+  } else {
+    state.selectedWorkspaceId = resolveWorkspaceId(localStorage.getItem(LAST_WORKSPACE_KEY) || "");
   }
+
+  bindEvents();
+  window.addEventListener("b2btrend:realtime", handleRealtimeEvent);
+  window.addEventListener("b2btrend:job-state", (event) => {
+    handleJobSnapshot(event.detail?.snapshot || {}, event.detail?.source || "event").catch(() => {});
+  });
+
+  const initialSnapshot = window.B2BTrendJobStatus?.getSnapshot?.();
+  if (initialSnapshot) {
+    await handleJobSnapshot(initialSnapshot, "bootstrap").catch((err) => {
+      notify(`Durum senkronizasyonu basarisiz: ${err.message}`, "warning", false);
+    });
+  }
+
+  try {
+    await loadWorkspaces();
+  } catch (err) {
+    state.workspaces = seedWorkspaces;
+    setSelectOptions(
+      el.workspaceSelect,
+      state.workspaces,
+      (x) => x.id,
+      workspaceOptionLabel,
+      state.selectedWorkspaceId
+    );
+    notify(`Workspace listesi alinamadi: ${err.message}`, "warning", false);
+  }
+
+  try {
+    await loadOverview();
+  } catch (err) {
+    notify(`Baslatma hatasi: ${err.message}`, "warning", false);
+  }
+
+  activateTab(state.activeTab || "tab-map");
 })();

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
+import os
 import threading
 from datetime import date
 from pathlib import Path
@@ -13,7 +15,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 import pycountry
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from geopy.geocoders import Nominatim
@@ -39,8 +41,15 @@ from src.analytics import (
     stl_decompose,
     trend_strength_meter,
 )
-from src.config import ALL_COUNTRIES, DEFAULT_KEYWORD, GEOCACHE_FILE, TOP_20_COUNTRIES
+from src.config import ALL_COUNTRIES, DEFAULT_KEYWORD, GEOCACHE_FILE, TOP_20_COUNTRIES, USER_AGENT
 from src.fetch_job_store import FetchJobStore, JobConflictError
+from src.fetch_resume_store import (
+    build_fetch_fingerprint,
+    clear_checkpoint,
+    is_checkpoint_compatible,
+    load_checkpoint,
+    save_checkpoint,
+)
 from src.reports import export_csv
 from src.trend_fetcher import (
     FetchConfig,
@@ -50,11 +59,13 @@ from src.trend_fetcher import (
     fetch_hourly_data,
     fetch_related_queries,
     fetch_related_topics,
+    fetch_timeline,
     fetch_trends_dataset,
     fetch_trends_dataset_country_keywords,
     save_snapshot,
 )
 from src.workspace_store import (
+    WorkspaceValidationError,
     create_workspace,
     delete_workspace,
     ensure_default_workspace,
@@ -75,6 +86,12 @@ STATIC_DIR = ROOT / "static"
 app = FastAPI(title="B2BTrend", version="4.2.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+logger = logging.getLogger(__name__)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    return Response(status_code=204)
 
 
 class WorkspaceCreate(BaseModel):
@@ -98,10 +115,18 @@ class WorkspaceUpdate(BaseModel):
 
 class FetchRequest(BaseModel):
     workspace_id: str
+    resume: bool = False
 
 
 class FetchCancelRequest(BaseModel):
     workspace_id: str | None = None
+
+
+class CityTimelineFetchRequest(BaseModel):
+    workspace_id: str
+    country: str
+    city: str
+    geo_code: str | None = None
 
 
 class WsHub:
@@ -134,7 +159,7 @@ def _schedule_broadcast(loop: asyncio.AbstractEventLoop, payload: dict) -> None:
     try:
         asyncio.run_coroutine_threadsafe(hub.broadcast(payload), loop)
     except Exception:
-        pass
+        logger.exception("Broadcast scheduling failed: %s", payload.get("type") if isinstance(payload, dict) else "unknown")
 
 
 def _language_to_hl(language: str) -> str:
@@ -151,7 +176,7 @@ def _job_update(job_id: str, loop: asyncio.AbstractEventLoop, payload: dict) -> 
     active = snapshot.get("active") or {}
     incoming_status = str((payload or {}).get("status") or "")
     if active.get("job_id") == job_id and active.get("status") == "cancelling" and incoming_status == "running":
-      return active
+        return active
     updated = fetch_job_store.update_job(job_id, **payload)
     if updated:
         _schedule_broadcast(loop, {"type": "fetch_job_update", "state": updated})
@@ -161,7 +186,11 @@ def _job_update(job_id: str, loop: asyncio.AbstractEventLoop, payload: dict) -> 
 def _is_job_cancel_requested(job_id: str) -> bool:
     snapshot = fetch_job_store.snapshot()
     active = snapshot.get("active") or snapshot.get("latest") or {}
-    return bool(active and active.get("job_id") == job_id and (active.get("cancel_requested") or active.get("status") == "cancelling"))
+    return bool(
+        active
+        and active.get("job_id") == job_id
+        and (active.get("cancel_requested") or active.get("status") in {"cancelling", "cancelled"})
+    )
 
 
 def _run_fetch_job(
@@ -174,7 +203,46 @@ def _run_fetch_job(
     language: str,
     use_topic_mode: bool,
     country_keywords: dict[str, str],
+    resume_requested: bool,
 ) -> None:
+    logger.info(
+        "Fetch job started: workspace=%s countries=%s topic_mode=%s keyword=%s language=%s resume=%s",
+        workspace_id,
+        len(countries),
+        use_topic_mode,
+        keyword,
+        language,
+        resume_requested,
+    )
+
+    fetch_fingerprint = build_fetch_fingerprint(
+        keyword=keyword,
+        countries=countries,
+        use_topic_mode=use_topic_mode,
+        language=language,
+        country_keywords=country_keywords,
+    )
+
+    resume_checkpoint = None
+    resume_state: dict | None = None
+    seed_cities = None
+    seed_timeline = None
+
+    if resume_requested:
+        candidate = load_checkpoint(workspace_id)
+        if is_checkpoint_compatible(candidate, fetch_fingerprint):
+            resume_checkpoint = candidate
+            state = candidate.get("resume_state")
+            if isinstance(state, dict):
+                resume_state = state
+            seed_cities, seed_timeline = load_workspace_dataset(workspace_id)
+        else:
+            clear_checkpoint(workspace_id)
+    else:
+        clear_checkpoint(workspace_id)
+
+    resume_enabled = bool(resume_checkpoint and isinstance(resume_state, dict))
+
     hl = _language_to_hl(language)
     cfg = FetchConfig(
         keyword=keyword,
@@ -183,9 +251,40 @@ def _run_fetch_job(
         backoff_factor=0.6,
         max_attempt_per_country=4,
         top_cities_per_country=10,
-        min_sleep_sec=max(5.0, 4.0),
-        max_sleep_sec=max(10.0, 9.0),
+        min_sleep_sec=max(4.0, 4.0),
+        max_sleep_sec=max(11.0, 9.0),
+        user_agent=USER_AGENT,  # Env'den sabit veya None (rastgele)
     )
+
+    last_resume_state: dict = dict(resume_state or {})
+
+    def persist_resume_checkpoint(status: str, phase: str, message: str = "", payload: dict | None = None) -> None:
+        nonlocal last_resume_state
+        if isinstance(payload, dict):
+            last_resume_state = dict(payload)
+
+        save_checkpoint(
+            workspace_id,
+            {
+                "job_id": job_id,
+                "fingerprint": fetch_fingerprint,
+                "status": status,
+                "phase": phase,
+                "message": message,
+                "resume_state": dict(last_resume_state),
+                "keyword": keyword,
+                "countries": list(countries),
+                "language": language,
+                "use_topic_mode": bool(use_topic_mode),
+                "country_keywords": dict(country_keywords),
+            },
+        )
+
+    start_message = "Veri cekimi arkaplanda basladi"
+    if resume_requested and resume_enabled:
+        start_message = "Veri cekimi kaldigi yerden devam ediyor"
+    elif resume_requested and not resume_enabled:
+        start_message = "Devam verisi bulunamadi, veri cekimi sifirdan basladi"
 
     _job_update(
         job_id,
@@ -193,18 +292,46 @@ def _run_fetch_job(
         {
             "status": "running",
             "phase": "prepare",
-            "message": "Veri cekimi arkaplanda basladi",
+            "message": start_message,
             "progress": 0.02,
             "completed": 0,
-            "total": max(1, len(countries) * 12),
+            "total": max(1, len(countries) * 2),
+            "resume_requested": resume_requested,
+            "resume_enabled": resume_enabled,
         },
+    )
+
+    persist_resume_checkpoint(
+        status="running",
+        phase="prepare",
+        message=start_message,
+        payload=resume_state,
     )
 
     def progress_callback(payload: dict) -> None:
         data = dict(payload or {})
         data.setdefault("status", "running")
         data.setdefault("phase", "running")
+        if data.get("phase") in {"city_list", "city_timeline", "country_timeline", "finalize"}:
+            logger.info(
+                "Fetch progress: job=%s phase=%s country=%s city=%s progress=%s message=%s",
+                job_id,
+                data.get("phase"),
+                data.get("country"),
+                data.get("city"),
+                data.get("progress"),
+                data.get("message"),
+            )
         _job_update(job_id, loop, data)
+
+    def checkpoint_callback(payload: dict) -> None:
+        phase = str(payload.get("phase") or "running")
+        message = str(payload.get("message") or "")
+        persist_resume_checkpoint(status="running", phase=phase, message=message, payload=payload)
+
+    def partial_save_callback(cities_df: pd.DataFrame, timeline_df: pd.DataFrame, payload: dict) -> None:
+        save_workspace_dataset(workspace_id, cities_df, timeline_df)
+        checkpoint_callback(payload)
 
     try:
         if use_topic_mode:
@@ -213,6 +340,11 @@ def _run_fetch_job(
                 cfg,
                 progress_callback=progress_callback,
                 cancel_callback=lambda: _is_job_cancel_requested(job_id),
+                seed_cities=seed_cities,
+                seed_timeline=seed_timeline,
+                resume_state=resume_state,
+                checkpoint_callback=checkpoint_callback,
+                partial_save_callback=partial_save_callback,
             )
         else:
             cities, timeline = fetch_trends_dataset_country_keywords(
@@ -222,15 +354,33 @@ def _run_fetch_job(
                 cfg,
                 progress_callback=progress_callback,
                 cancel_callback=lambda: _is_job_cancel_requested(job_id),
+                seed_cities=seed_cities,
+                seed_timeline=seed_timeline,
+                resume_state=resume_state,
+                checkpoint_callback=checkpoint_callback,
+                partial_save_callback=partial_save_callback,
             )
 
+        if _is_job_cancel_requested(job_id):
+            raise FetchCancelledError("Fetch cancelled")
+
         if cities.empty or timeline.empty:
-            # Dataset empty olsa bile bu durum exploit edilebilir; hata yap31lm315f saymayal31m.
+            logger.warning(
+                "Fetch completed with empty dataset: workspace=%s job=%s cities=%s timeline=%s keyword=%s countries=%s topic_mode=%s",
+                workspace_id,
+                job_id,
+                len(cities),
+                len(timeline),
+                keyword,
+                use_topic_mode,
+            )
             save_workspace_dataset(workspace_id, cities, timeline)
             try:
                 save_snapshot(cities, timeline, keyword=keyword)
             except Exception:
-                pass
+                logger.exception("Snapshot save failed for empty dataset: workspace=%s job=%s", workspace_id, job_id)
+
+            clear_checkpoint(workspace_id)
 
             final = fetch_job_store.finish_job(
                 job_id,
@@ -247,7 +397,9 @@ def _run_fetch_job(
         try:
             save_snapshot(cities, timeline, keyword=keyword)
         except Exception:
-            pass
+            logger.exception("Snapshot save failed: workspace=%s job=%s", workspace_id, job_id)
+
+        clear_checkpoint(workspace_id)
 
         final = fetch_job_store.finish_job(
             job_id,
@@ -259,17 +411,31 @@ def _run_fetch_job(
             _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
             _schedule_broadcast(loop, {"type": "fetch_done", "state": final})
     except FetchCancelledError:
+        logger.info("Fetch job cancelled: workspace=%s job=%s", workspace_id, job_id)
         final = fetch_job_store.update_job(
             job_id,
             status="cancelled",
             phase="cancelled",
             message="Veri cekimi iptal edildi",
         )
+        persist_resume_checkpoint(
+            status="cancelled",
+            phase="cancelled",
+            message="Veri cekimi iptal edildi",
+            payload=last_resume_state,
+        )
         if final:
             _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
             _schedule_broadcast(loop, {"type": "fetch_cancelled", "state": final})
     except Exception as exc:
+        logger.exception("Fetch job failed: workspace=%s job=%s", workspace_id, job_id)
         message = f"Veri cekimi basarisiz: {exc}"
+        persist_resume_checkpoint(
+            status="failed",
+            phase="failed",
+            message=message,
+            payload=last_resume_state,
+        )
         final = fetch_job_store.finish_job(
             job_id,
             status="failed",
@@ -279,6 +445,108 @@ def _run_fetch_job(
         if final:
             _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
             _schedule_broadcast(loop, {"type": "fetch_failed", "state": final})
+
+
+def _download_city_timeline_for_workspace(
+    workspace_id: str,
+    country: str,
+    city: str,
+    geo_code: str | None = None,
+) -> dict:
+    snapshot = fetch_job_store.snapshot()
+    active = snapshot.get("active") or {}
+    if active and active.get("status") in {"queued", "running", "cancelling"}:
+        raise HTTPException(status_code=409, detail="Arkaplanda calisan bir veri cekimi varken manuel sehir cekimi yapilamaz.")
+
+    workspace_key = str(workspace_id or "").strip()
+    country_key = str(country or "").strip().upper()
+    city_key = str(city or "").strip()
+    geo_key = str(geo_code or "").strip()
+
+    if not workspace_key or not country_key or not city_key:
+        raise HTTPException(status_code=422, detail="workspace_id, country ve city zorunludur.")
+
+    meta = load_workspace_meta(workspace_key)
+    cities_df, timeline_df = load_workspace_dataset(workspace_key)
+    if cities_df.empty:
+        raise HTTPException(status_code=409, detail="Once otomatik sehir skorlarini indirin.")
+
+    city_rows = cities_df[cities_df["country"].astype(str).str.strip().str.upper() == country_key].copy()
+    city_rows["city_norm"] = city_rows["city"].fillna("").astype(str).str.strip().str.casefold()
+    city_rows["geo_norm"] = city_rows["geo_code"].fillna("").astype(str).str.strip()
+
+    resolved_city_rows = city_rows[city_rows["city_norm"] == city_key.casefold()].copy()
+    if geo_key:
+        geo_rows = city_rows[city_rows["geo_norm"] == geo_key].copy()
+        if not geo_rows.empty:
+            resolved_city_rows = geo_rows
+
+    if resolved_city_rows.empty:
+        raise HTTPException(status_code=404, detail="Sehir bulunamadi.")
+
+    resolved_row = resolved_city_rows.iloc[0]
+    resolved_geo = str(resolved_row.get("geo_code", "")).strip() or geo_key
+    resolved_city = str(resolved_row.get("city", city_key)).strip() or city_key
+    if not resolved_geo:
+        raise HTTPException(status_code=404, detail="Sehir icin geo_code bulunamadi.")
+
+    existing = timeline_df[
+        (timeline_df["country"].astype(str).str.strip().str.upper() == country_key)
+        & (
+            (timeline_df["geo_code"].astype(str).str.strip() == resolved_geo)
+            | (timeline_df["city"].fillna("").astype(str).str.strip().str.casefold() == resolved_city.casefold())
+        )
+    ]
+    if not existing.empty:
+        return {
+            "ok": True,
+            "status": "skipped",
+            "message": "Sehir zaman serisi zaten kayitli.",
+            "workspace_id": workspace_key,
+            "country": country_key,
+            "city": resolved_city,
+            "geo_code": resolved_geo,
+            "timeline_rows": int(len(existing)),
+        }
+
+    keyword = str(meta.get("keyword") or DEFAULT_KEYWORD).strip() or DEFAULT_KEYWORD
+    language = str(meta.get("language") or "tr").strip() or "tr"
+    cfg = FetchConfig(keyword=keyword, hl=_language_to_hl(language))
+    client = _build_client(cfg)
+    city_timeline = fetch_timeline(client, resolved_geo, cfg, phase="city_timeline")
+    if city_timeline.empty:
+        return {
+            "ok": False,
+            "status": "empty",
+            "message": "Sehir zaman serisi bulunamadi.",
+            "workspace_id": workspace_key,
+            "country": country_key,
+            "city": resolved_city,
+            "geo_code": resolved_geo,
+        }
+
+    city_timeline = city_timeline.copy()
+    city_timeline["country"] = country_key
+    city_timeline["city"] = resolved_city
+    city_timeline["geo_code"] = resolved_geo
+    merged_timeline = pd.concat([timeline_df, city_timeline[["country", "city", "geo_code", "date", "score"]]], ignore_index=True)
+
+    save_workspace_dataset(workspace_key, cities_df, merged_timeline)
+    try:
+        save_snapshot(cities_df, merged_timeline, keyword=keyword)
+    except Exception:
+        logger.exception("Snapshot save failed for manual city timeline: workspace=%s country=%s city=%s", workspace_key, country_key, resolved_city)
+
+    return {
+        "ok": True,
+        "status": "completed",
+        "message": "Sehir zaman serisi kaydedildi.",
+        "workspace_id": workspace_key,
+        "country": country_key,
+        "city": resolved_city,
+        "geo_code": resolved_geo,
+        "timeline_rows": int(len(city_timeline)),
+    }
 
 
 def _fig_to_dict(fig: go.Figure) -> dict:
@@ -346,12 +614,20 @@ def _filter_timeline(timeline: pd.DataFrame, date_range: str, start: date | None
     return out.sort_values("date").reset_index(drop=True)
 
 
+def _normalize_geocode_key(value: str | None) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
 def _load_geocache() -> pd.DataFrame:
     if GEOCACHE_FILE.exists():
-        cache = pd.read_csv(GEOCACHE_FILE)
+        cache = pd.read_csv(GEOCACHE_FILE, dtype={"country": str, "city": str, "lat": str, "lon": str})
         for col in ["country", "city", "lat", "lon"]:
             if col not in cache.columns:
                 cache[col] = pd.NA
+        cache["country"] = cache["country"].fillna("").astype(str).map(_normalize_geocode_key)
+        cache["city"] = cache["city"].fillna("").astype(str).map(_normalize_geocode_key)
         cache["lat"] = pd.to_numeric(cache["lat"], errors="coerce")
         cache["lon"] = pd.to_numeric(cache["lon"], errors="coerce")
         return cache[["country", "city", "lat", "lon"]]
@@ -365,16 +641,27 @@ def _load_geocache() -> pd.DataFrame:
 
 
 def _save_geocache(df: pd.DataFrame) -> None:
+    cache = df.copy()
+    cache["country"] = cache["country"].fillna("").astype(str).map(_normalize_geocode_key)
+    cache["city"] = cache["city"].fillna("").astype(str).map(_normalize_geocode_key)
+    cache["lat"] = pd.to_numeric(cache["lat"], errors="coerce")
+    cache["lon"] = pd.to_numeric(cache["lon"], errors="coerce")
     GEOCACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(GEOCACHE_FILE, index=False)
+    cache.to_csv(GEOCACHE_FILE, index=False)
 
 
 def _geocode_cities(df: pd.DataFrame) -> pd.DataFrame:
     cache = _load_geocache()
     work = df[["country", "city"]].drop_duplicates().copy()
+    work["country"] = work["country"].fillna("").astype(str).map(_normalize_geocode_key)
+    work["city"] = work["city"].fillna("").astype(str).map(_normalize_geocode_key)
+
+    cache_keys = cache[["country", "city"]].drop_duplicates()
     merged = work.merge(cache, on=["country", "city"], how="left")
 
-    missing = merged[merged["lat"].isna() | merged["lon"].isna()][["country", "city"]]
+    missing = work.merge(cache_keys, on=["country", "city"], how="left", indicator=True)
+    missing = missing[missing["_merge"] == "left_only"][["country", "city"]].drop_duplicates()
+    missing = missing[(missing["country"] != "") & (missing["city"] != "")]
     if missing.empty:
         return merged
 
@@ -393,6 +680,8 @@ def _geocode_cities(df: pd.DataFrame) -> pd.DataFrame:
 
     if new_rows:
         new_df = pd.DataFrame(new_rows)
+        new_df["country"] = new_df["country"].fillna("").astype(str).map(_normalize_geocode_key)
+        new_df["city"] = new_df["city"].fillna("").astype(str).map(_normalize_geocode_key)
         new_df["lat"] = pd.to_numeric(new_df["lat"], errors="coerce")
         new_df["lon"] = pd.to_numeric(new_df["lon"], errors="coerce")
         cache = pd.concat([cache, new_df[["country", "city", "lat", "lon"]]], ignore_index=True)
@@ -471,7 +760,7 @@ def _render_world_charts(country_summary: pd.DataFrame, cities: pd.DataFrame, se
             fig_drill.update_layout(height=520, margin=dict(l=0, r=0, t=8, b=0))
 
     city_world = go.Figure()
-    city_map_all = cities.sort_values("score", ascending=False).head(250).copy()
+    city_map_all = cities.sort_values("score", ascending=False).head(100).copy()
     if not city_map_all.empty:
         points_all = _geocode_cities(city_map_all)
         points_all = points_all.merge(city_map_all[["country", "city", "score"]], on=["country", "city"], how="left").dropna(subset=["lat", "lon"])
@@ -601,46 +890,78 @@ def _render_country_analysis(timeline: pd.DataFrame, country_code: str) -> dict:
     }
 
 
-def _render_city_analysis(timeline: pd.DataFrame, cities: pd.DataFrame, country_code: str, city_name: str | None) -> dict:
-    country_cities_df = cities[cities["country"] == country_code].sort_values("score", ascending=False)
+def _render_city_analysis(
+    timeline: pd.DataFrame,
+    cities: pd.DataFrame,
+    country_code: str,
+    city_name: str | None,
+    selected_geo_code: str | None = None,
+) -> dict:
+    country_cities_df = cities[cities["country"] == country_code].sort_values("score", ascending=False).reset_index(drop=True)
     ranked = location_trend_ranking(country_cities_df)
-    city_names = sorted([c for c in timeline[timeline["country"] == country_code]["city"].dropna().unique().tolist() if str(c).strip()])
+    city_names = list(dict.fromkeys([str(item).strip() for item in country_cities_df["city"].dropna().tolist() if str(item).strip()]))
+    requested_geo_code = str(selected_geo_code or "").strip()
 
     if not city_names:
         return {
             "country": country_code,
             "city": None,
             "city_options": [],
-            "ranking": ranked[["rank", "city", "score", "geo_code"]].head(30).to_dict(orient="records") if not ranked.empty else [],
-            "message": "No city timeline data",
+            "ranking": [],
+            "timeline_ready": False,
+            "message": "Sehir skoru verisi yok",
             "charts": {},
             "stats": {},
         }
 
-    selected_city = city_name if city_name in city_names else city_names[0]
-    city_ts = (
-        timeline[(timeline["country"] == country_code) & (timeline["city"] == selected_city)][["date", "score"]]
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    normalized_city_name = str(city_name or "").strip().casefold()
+    selected_row = pd.DataFrame()
+    if requested_geo_code:
+        selected_row = ranked[ranked["geo_code"].fillna("").astype(str).str.strip() == requested_geo_code].head(1)
+    if selected_row.empty:
+        selected_row = ranked[ranked["city"].astype(str).str.strip().str.casefold() == normalized_city_name].head(1)
 
-    city_ts["score_clean"], outlier_count = clean_city_outliers(city_ts["score"]) if not city_ts.empty else (pd.Series(dtype=float), 0)
-    city_signal = robust_trend_signal(city_ts["score_clean"]) if not city_ts.empty else {"direction": "flat", "label": "No data", "slope": 0, "volatility": 0}
-    city_scores = compute_trend_scores(city_ts["score_clean"]) if not city_ts.empty else {"growth_rate": 0}
-    city_mas = compute_moving_averages(city_ts["score_clean"]) if not city_ts.empty else {"ma7": pd.Series(dtype=float)}
-    city_strength = trend_strength_meter(city_ts["score_clean"]) if not city_ts.empty else {"score": 0, "label": "No data"}
+    selected_city = str(selected_row.iloc[0]["city"]) if not selected_row.empty else next((item for item in city_names if item.casefold() == normalized_city_name), city_names[0])
+    selected_geo_code = requested_geo_code or (str(selected_row.iloc[0]["geo_code"]) if not selected_row.empty else "")
+    selected_score = float(selected_row.iloc[0]["score"]) if not selected_row.empty else 0.0
 
+    country_timeline = timeline[timeline["country"] == country_code].copy()
+    city_ts = pd.DataFrame(columns=["date", "score"])
+    if selected_geo_code:
+        geo_mask = country_timeline["geo_code"].fillna("").astype(str).str.strip() == selected_geo_code
+        city_ts = country_timeline[geo_mask][["date", "score"]].copy()
+    if city_ts.empty:
+        name_mask = country_timeline["city"].fillna("").astype(str).str.strip().str.casefold() == selected_city.casefold()
+        city_ts = country_timeline[name_mask][["date", "score"]].copy()
+    city_ts = city_ts.sort_values("date").reset_index(drop=True)
+
+    timeline_ready = not city_ts.empty
+    city_signal = {"direction": "flat", "label": "Zaman serisi bekleniyor", "slope": 0, "volatility": 0}
+    city_scores = {"growth_rate": 0}
+    city_mas = {"ma7": pd.Series(dtype=float)}
+    city_strength = {"score": 0, "label": "Zaman serisi bekleniyor"}
+    outlier_count = 0
     fig_city = go.Figure()
-    if not city_ts.empty:
+    city_forecast = pd.DataFrame()
+    message = "Sehir zaman serisi henüz indirilmedi. Manuel indirme butonunu kullanin."
+
+    if timeline_ready:
+        city_ts["score_clean"], outlier_count = clean_city_outliers(city_ts["score"])
+        city_signal = robust_trend_signal(city_ts["score_clean"])
+        city_scores = compute_trend_scores(city_ts["score_clean"])
+        city_mas = compute_moving_averages(city_ts["score_clean"])
+        city_strength = trend_strength_meter(city_ts["score_clean"])
+
         fig_city.add_trace(go.Scatter(x=city_ts["date"], y=city_ts["score"], mode="lines", name="Raw", opacity=0.3, line=dict(color="#94a3b8", width=1)))
         fig_city.add_trace(go.Scatter(x=city_ts["date"], y=city_ts["score_clean"], mode="lines", name="Clean", line=dict(color="#0f766e", width=2), fill="tozeroy", fillcolor="rgba(15,118,110,0.08)"))
         fig_city.add_trace(go.Scatter(x=city_ts["date"], y=city_mas["ma7"], mode="lines", name="MA7", line=dict(color="#f97316", width=1.5, dash="dot")))
 
-    city_forecast = advanced_forecast(city_ts["score_clean"], periods=12) if not city_ts.empty else pd.DataFrame()
-    if not city_forecast.empty:
-        fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat_upper"], mode="lines", line=dict(width=0), showlegend=False))
-        fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat_lower"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(249,115,22,0.1)", name="95% CI"))
-        fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat"], mode="lines", name="Forecast", line=dict(color="#f97316", width=2, dash="dash")))
+        city_forecast = advanced_forecast(city_ts["score_clean"], periods=12)
+        if not city_forecast.empty:
+            fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat_upper"], mode="lines", line=dict(width=0), showlegend=False))
+            fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat_lower"], mode="lines", line=dict(width=0), fill="tonexty", fillcolor="rgba(249,115,22,0.1)", name="95% CI"))
+            fig_city.add_trace(go.Scatter(x=city_forecast["ds"], y=city_forecast["yhat"], mode="lines", name="Forecast", line=dict(color="#f97316", width=2, dash="dash")))
+        message = ""
 
     fig_city.update_layout(height=430, margin=dict(l=20, r=20, t=45, b=20), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", hovermode="x unified")
 
@@ -648,6 +969,10 @@ def _render_city_analysis(timeline: pd.DataFrame, cities: pd.DataFrame, country_
         "country": country_code,
         "city": selected_city,
         "city_options": city_names,
+        "geo_code": selected_geo_code,
+        "selected_score": selected_score,
+        "timeline_ready": timeline_ready,
+        "message": message,
         "ranking": ranked[["rank", "city", "score", "geo_code"]].head(30).to_dict(orient="records") if not ranked.empty else [],
         "stats": {
             "signal": city_signal,
@@ -815,16 +1140,20 @@ async def api_workspaces() -> dict:
 
 @app.post("/api/workspaces")
 async def api_create_workspace(payload: WorkspaceCreate) -> dict:
-    created = create_workspace(name=payload.name, keyword=payload.keyword, countries=payload.countries)
-    updated = update_workspace(
-        created["id"],
-        name=payload.name,
-        language=payload.language,
-        keyword=payload.keyword,
-        countries=payload.countries,
-        use_topic_mode=payload.use_topic_mode,
-        country_keywords=_clean_country_keywords(payload.country_keywords, payload.countries),
-    )
+    try:
+        created = create_workspace(name=payload.name, keyword=payload.keyword, countries=payload.countries)
+        updated = update_workspace(
+            created["id"],
+            name=payload.name,
+            language=payload.language,
+            keyword=payload.keyword,
+            countries=payload.countries,
+            use_topic_mode=payload.use_topic_mode,
+            country_keywords=_clean_country_keywords(payload.country_keywords, payload.countries),
+        )
+    except WorkspaceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     await hub.broadcast({"type": "workspace_created", "workspace_id": updated["id"]})
     return {"item": _workspace_payload(updated)}
 
@@ -832,15 +1161,37 @@ async def api_create_workspace(payload: WorkspaceCreate) -> dict:
 @app.patch("/api/workspaces/{workspace_id}")
 async def api_update_workspace(workspace_id: str, payload: WorkspaceUpdate) -> dict:
     meta = load_workspace_meta(workspace_id)
-    updated = update_workspace(
-        workspace_id,
-        name=payload.name if payload.name is not None else str(meta.get("name") or workspace_id),
-        language=payload.language if payload.language is not None else str(meta.get("language") or "tr"),
-        keyword=payload.keyword if payload.keyword is not None else str(meta.get("keyword") or DEFAULT_KEYWORD),
-        countries=payload.countries if payload.countries is not None else list(meta.get("countries") or TOP_20_COUNTRIES),
-        use_topic_mode=payload.use_topic_mode if payload.use_topic_mode is not None else bool(meta.get("use_topic_mode", False)),
-        country_keywords=payload.country_keywords if payload.country_keywords is not None else dict(meta.get("country_keywords") or {}),
-    )
+    if (
+        payload.name is None
+        and payload.keyword is None
+        and payload.countries is None
+        and payload.language is None
+        and payload.use_topic_mode is None
+        and payload.country_keywords is None
+    ):
+        if payload.is_default:
+            set_default_workspace(workspace_id)
+        await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id})
+        refreshed = load_workspace_meta(workspace_id)
+        return {"item": _workspace_payload(refreshed)}
+
+    countries = payload.countries if payload.countries is not None else list(meta.get("countries") or TOP_20_COUNTRIES)
+    country_keywords = payload.country_keywords if payload.country_keywords is not None else dict(meta.get("country_keywords") or {})
+    country_keywords = _clean_country_keywords(country_keywords, countries)
+
+    try:
+        updated = update_workspace(
+            workspace_id,
+            name=payload.name if payload.name is not None else str(meta.get("name") or workspace_id),
+            language=payload.language if payload.language is not None else str(meta.get("language") or "tr"),
+            keyword=payload.keyword if payload.keyword is not None else str(meta.get("keyword") or DEFAULT_KEYWORD),
+            countries=countries,
+            use_topic_mode=payload.use_topic_mode if payload.use_topic_mode is not None else bool(meta.get("use_topic_mode", False)),
+            country_keywords=country_keywords,
+        )
+    except WorkspaceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     if payload.is_default:
         set_default_workspace(workspace_id)
     await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id})
@@ -864,11 +1215,13 @@ async def api_clear_cache() -> dict:
 @app.post("/api/fetch")
 async def api_fetch(payload: FetchRequest) -> JSONResponse:
     meta = load_workspace_meta(payload.workspace_id)
+    resume_requested = bool(payload.resume)
     keyword = str(meta.get("keyword") or DEFAULT_KEYWORD).strip() or DEFAULT_KEYWORD
     countries = list(meta.get("countries") or TOP_20_COUNTRIES)
     use_topic_mode = bool(meta.get("use_topic_mode", False))
     country_keywords = dict(meta.get("country_keywords") or {})
     language = str(meta.get("language") or "tr").strip() or "tr"
+    clean_country_keywords = _clean_country_keywords(country_keywords, countries)
 
     try:
         job = fetch_job_store.start_job(
@@ -877,7 +1230,8 @@ async def api_fetch(payload: FetchRequest) -> JSONResponse:
             countries=countries,
             use_topic_mode=use_topic_mode,
             language=language,
-            country_keywords=_clean_country_keywords(country_keywords, countries),
+            country_keywords=clean_country_keywords,
+            resume_requested=resume_requested,
         )
     except JobConflictError as exc:
         return JSONResponse(status_code=409, content={"ok": False, "detail": "Bu anda baska bir veri cekimi calisiyor", "job": exc.active_job})
@@ -896,7 +1250,8 @@ async def api_fetch(payload: FetchRequest) -> JSONResponse:
             "countries": countries,
             "language": language,
             "use_topic_mode": use_topic_mode,
-            "country_keywords": _clean_country_keywords(country_keywords, countries),
+            "country_keywords": clean_country_keywords,
+            "resume_requested": resume_requested,
         },
         daemon=True,
     )
@@ -992,16 +1347,33 @@ async def api_dashboard_city(
     workspace_id: str = Query(...),
     country: str = Query(...),
     city: str | None = Query(None),
+    geo_code: str | None = Query(None),
     range: str = Query("all"),
     start: date | None = Query(None),
     end: date | None = Query(None),
 ) -> dict:
     meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
-    if cities.empty or timeline.empty:
-        return _empty_dashboard(meta, "No data")
+    if cities.empty:
+        return _empty_dashboard(meta, "No city score data yet. Run fetch first.")
 
-    result = await asyncio.to_thread(_render_city_analysis, timeline, cities, country, city)
+    result = await asyncio.to_thread(_render_city_analysis, timeline, cities, country, city, geo_code)
     return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+
+
+@app.post("/api/fetch/city-timeline")
+async def api_fetch_city_timeline(payload: CityTimelineFetchRequest) -> dict:
+    result = await asyncio.to_thread(
+        _download_city_timeline_for_workspace,
+        payload.workspace_id,
+        payload.country,
+        payload.city,
+        payload.geo_code,
+    )
+
+    if not result.get("ok") and result.get("status") == "empty":
+        raise HTTPException(status_code=502, detail=str(result.get("message") or "Sehir zaman serisi alinmadi."))
+
+    return result
 
 
 @app.get("/api/dashboard/hourly")
@@ -1118,4 +1490,5 @@ async def ws_status(ws: WebSocket) -> None:
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    reload_enabled = os.getenv("B2BTREND_RELOAD", "").strip().lower() in {"1", "true", "yes", "on"}
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=reload_enabled)
