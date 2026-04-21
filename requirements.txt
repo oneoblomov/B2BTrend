@@ -6,7 +6,8 @@ python-dotenv
 statsmodels
 scipy
 fpdf2
-pytrends-modern[]
+pytrends-modern
+selenium
 urllib3
 pyarrow
 fastapi
