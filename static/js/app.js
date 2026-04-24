@@ -4,6 +4,7 @@ const defaultWorkspaceId = root.dataset.defaultWorkspace || "";
 const THEME_KEY = "b2btrend-theme";
 const LAST_WORKSPACE_KEY = "b2btrend-last-workspace";
 const BROWSER_STATE_KEY = "b2btrend-browser-state";
+const API_CACHE_PREFIX = "b2btrend-api-cache:";
 
 function resolveWorkspaceId(candidate, availableWorkspaces = seedWorkspaces) {
   if (candidate && availableWorkspaces.some((item) => item.id === candidate)) {
@@ -443,12 +444,31 @@ function writeUrlState() {
 }
 
 async function getJSON(path, params = {}) {
-  const res = await fetch(`${path}?${toQuery(params)}`);
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(txt || `Request failed: ${path}`);
+  const query = toQuery(params);
+  const url = query ? `${path}?${query}` : path;
+  const cacheKey = `${API_CACHE_PREFIX}${url}`;
+
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt || `Request failed: ${path}`);
+    }
+
+    const payload = await res.json();
+    await window.B2BTrendStorage?.set(cacheKey, payload).catch(() => {});
+    return payload;
+  } catch (error) {
+    try {
+      const cached = await window.B2BTrendStorage?.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+    } catch (_cacheError) {
+      // ignore cache lookup failures and rethrow the network error below
+    }
+    throw error;
   }
-  return res.json();
 }
 
 async function getStoredValue(key) {
@@ -826,6 +846,7 @@ async function clearCache() {
 function handleRealtimeEvent(event) {
   const payload = event.detail || {};
   if (!payload.type) return;
+  if (payload.client_id && payload.client_id !== window.B2BTrendStorage?.clientId) return;
 
   if (payload.type === "workspace_created" || payload.type === "workspace_updated" || payload.type === "workspace_deleted") {
     loadWorkspaces().catch(() => {});

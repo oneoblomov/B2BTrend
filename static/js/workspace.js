@@ -17,6 +17,8 @@ const inputCountryKeywords = document.getElementById("ws-country-keywords");
 
 const THEME_KEY = "b2btrend-theme";
 const LAST_WORKSPACE_KEY = "b2btrend-last-workspace";
+const API_CACHE_PREFIX = "b2btrend-api-cache:";
+const WORKSPACES_CACHE_KEY = `${API_CACHE_PREFIX}/api/workspaces`;
 
 const state = {
   workspaces: JSON.parse(root.dataset.workspaces || "[]"),
@@ -176,10 +178,24 @@ function render() {
 }
 
 async function getWorkspaces() {
-  const res = await fetch("/api/workspaces");
-  const payload = await res.json();
-  state.workspaces = payload.items || [];
-  render();
+  try {
+    const res = await fetch("/api/workspaces");
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
+    const payload = await res.json();
+    state.workspaces = payload.items || [];
+    await window.B2BTrendStorage?.set(WORKSPACES_CACHE_KEY, payload).catch(() => {});
+    render();
+  } catch (_error) {
+    const cached = await window.B2BTrendStorage?.get(WORKSPACES_CACHE_KEY).catch(() => null);
+    if (cached) {
+      state.workspaces = cached.items || [];
+      render();
+      return;
+    }
+    throw _error;
+  }
 }
 
 function openCreate() {
@@ -285,6 +301,9 @@ async function removeWorkspace(id) {
 
 function handleRealtimeEvent(event) {
   const payload = event.detail || {};
+  if (payload.client_id && payload.client_id !== window.B2BTrendStorage?.clientId) {
+    return;
+  }
   if (payload.type === "workspace_created" || payload.type === "workspace_updated" || payload.type === "workspace_deleted") {
     getWorkspaces().catch(() => {});
   }

@@ -99,6 +99,7 @@ jinja_env = jinja2.Environment(
 )
 templates = Jinja2Templates(env=jinja_env)
 logger = logging.getLogger(__name__)
+CLIENT_ID_HEADER = "x-b2btrend-client-id"
 _GEOCACHE = pd.DataFrame(
     {
         "country": pd.Series(dtype="string"),
@@ -157,20 +158,49 @@ class CityTimelineFetchRequest(BaseModel):
     geo_code: str | None = None
 
 
+def _client_id_from_request(request: Request) -> str:
+    value = (
+        request.headers.get(CLIENT_ID_HEADER)
+        or request.cookies.get("b2btrend-client-id")
+        or request.query_params.get("client_id")
+        or ""
+    )
+    return str(value).strip()
+
+
+def _fetch_job_snapshot(client_id: str | None = None) -> dict:
+    try:
+        return fetch_job_store.snapshot(client_id)
+    except TypeError:
+        return fetch_job_store.snapshot()
+
+
 class WsHub:
     def __init__(self) -> None:
-        self.connections: set[WebSocket] = set()
+        self.connections_by_client: dict[str, set[WebSocket]] = {}
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(self, ws: WebSocket, client_id: str | None = None) -> None:
         await ws.accept()
-        self.connections.add(ws)
+        scope = str(client_id or "").strip() or "anonymous"
+        self.connections_by_client.setdefault(scope, set()).add(ws)
 
     def disconnect(self, ws: WebSocket) -> None:
-        self.connections.discard(ws)
+        empty_scopes: list[str] = []
+        for scope, connections in self.connections_by_client.items():
+            connections.discard(ws)
+            if not connections:
+                empty_scopes.append(scope)
+        for scope in empty_scopes:
+            self.connections_by_client.pop(scope, None)
 
     async def broadcast(self, payload: dict) -> None:
+        client_id = str((payload or {}).get("client_id") or "").strip()
+        if client_id:
+            targets = list(self.connections_by_client.get(client_id, set()))
+        else:
+            targets = [ws for connections in self.connections_by_client.values() for ws in connections]
         stale: list[WebSocket] = []
-        for ws in self.connections:
+        for ws in targets:
             try:
                 await ws.send_json(payload)
             except Exception:
@@ -199,20 +229,20 @@ def _language_to_hl(language: str) -> str:
     return "en-US"
 
 
-def _job_update(job_id: str, loop: asyncio.AbstractEventLoop, payload: dict) -> dict | None:
-    snapshot = fetch_job_store.snapshot()
+def _job_update(job_id: str, loop: asyncio.AbstractEventLoop, payload: dict, client_id: str | None = None) -> dict | None:
+    snapshot = _fetch_job_snapshot(client_id)
     active = snapshot.get("active") or {}
     incoming_status = str((payload or {}).get("status") or "")
     if active.get("job_id") == job_id and active.get("status") == "cancelling" and incoming_status == "running":
         return active
-    updated = fetch_job_store.update_job(job_id, **payload)
+    updated = fetch_job_store.update_job(job_id, client_id=client_id, **payload)
     if updated:
-        _schedule_broadcast(loop, {"type": "fetch_job_update", "state": updated})
+        _schedule_broadcast(loop, {"type": "fetch_job_update", "state": updated, "client_id": client_id})
     return updated
 
 
-def _is_job_cancel_requested(job_id: str) -> bool:
-    snapshot = fetch_job_store.snapshot()
+def _is_job_cancel_requested(job_id: str, client_id: str | None = None) -> bool:
+    snapshot = _fetch_job_snapshot(client_id)
     active = snapshot.get("active") or snapshot.get("latest") or {}
     return bool(
         active
@@ -232,6 +262,7 @@ def _run_fetch_job(
     use_topic_mode: bool,
     country_keywords: dict[str, str],
     resume_requested: bool,
+    client_id: str | None,
 ) -> None:
     logger.info(
         "Fetch job started: workspace=%s countries=%s topic_mode=%s keyword=%s language=%s resume=%s",
@@ -257,17 +288,17 @@ def _run_fetch_job(
     seed_timeline = None
 
     if resume_requested:
-        candidate = load_checkpoint(workspace_id)
+        candidate = load_checkpoint(workspace_id, client_id=client_id)
         if is_checkpoint_compatible(candidate, fetch_fingerprint):
             resume_checkpoint = candidate
             state = candidate.get("resume_state")
             if isinstance(state, dict):
                 resume_state = state
-            seed_cities, seed_timeline = load_workspace_dataset(workspace_id)
+            seed_cities, seed_timeline = load_workspace_dataset(workspace_id, client_id=client_id)
         else:
-            clear_checkpoint(workspace_id)
+            clear_checkpoint(workspace_id, client_id=client_id)
     else:
-        clear_checkpoint(workspace_id)
+        clear_checkpoint(workspace_id, client_id=client_id)
 
     resume_enabled = bool(resume_checkpoint and isinstance(resume_state, dict))
 
@@ -306,6 +337,7 @@ def _run_fetch_job(
                 "use_topic_mode": bool(use_topic_mode),
                 "country_keywords": dict(country_keywords),
             },
+            client_id=client_id,
         )
 
     start_message = "Veri cekimi arkaplanda basladi"
@@ -327,6 +359,7 @@ def _run_fetch_job(
             "resume_requested": resume_requested,
             "resume_enabled": resume_enabled,
         },
+        client_id=client_id,
     )
 
     persist_resume_checkpoint(
@@ -350,7 +383,7 @@ def _run_fetch_job(
                 data.get("progress"),
                 data.get("message"),
             )
-        _job_update(job_id, loop, data)
+        _job_update(job_id, loop, data, client_id=client_id)
 
     def checkpoint_callback(payload: dict) -> None:
         phase = str(payload.get("phase") or "running")
@@ -358,7 +391,7 @@ def _run_fetch_job(
         persist_resume_checkpoint(status="running", phase=phase, message=message, payload=payload)
 
     def partial_save_callback(cities_df: pd.DataFrame, timeline_df: pd.DataFrame, payload: dict) -> None:
-        save_workspace_dataset(workspace_id, cities_df, timeline_df)
+        save_workspace_dataset(workspace_id, cities_df, timeline_df, client_id=client_id)
         checkpoint_callback(payload)
 
     try:
@@ -367,7 +400,7 @@ def _run_fetch_job(
                 countries,
                 cfg,
                 progress_callback=progress_callback,
-                cancel_callback=lambda: _is_job_cancel_requested(job_id),
+                cancel_callback=lambda: _is_job_cancel_requested(job_id, client_id=client_id),
                 seed_cities=seed_cities,
                 seed_timeline=seed_timeline,
                 resume_state=resume_state,
@@ -381,7 +414,7 @@ def _run_fetch_job(
                 keyword,
                 cfg,
                 progress_callback=progress_callback,
-                cancel_callback=lambda: _is_job_cancel_requested(job_id),
+                cancel_callback=lambda: _is_job_cancel_requested(job_id, client_id=client_id),
                 seed_cities=seed_cities,
                 seed_timeline=seed_timeline,
                 resume_state=resume_state,
@@ -389,7 +422,7 @@ def _run_fetch_job(
                 partial_save_callback=partial_save_callback,
             )
 
-        if _is_job_cancel_requested(job_id):
+        if _is_job_cancel_requested(job_id, client_id=client_id):
             raise FetchCancelledError("Fetch cancelled")
 
         if cities.empty or timeline.empty:
@@ -402,46 +435,49 @@ def _run_fetch_job(
                 keyword,
                 use_topic_mode,
             )
-            save_workspace_dataset(workspace_id, cities, timeline)
+            save_workspace_dataset(workspace_id, cities, timeline, client_id=client_id)
             try:
                 save_snapshot(cities, timeline, keyword=keyword)
             except Exception:
                 logger.exception("Snapshot save failed for empty dataset: workspace=%s job=%s", workspace_id, job_id)
 
-            clear_checkpoint(workspace_id)
+            clear_checkpoint(workspace_id, client_id=client_id)
 
             final = fetch_job_store.finish_job(
                 job_id,
                 status="completed",
                 message="Veri cekimi tamamlandi (veri yok).",
                 result={"cities": int(len(cities)), "timeline": int(len(timeline))},
+                client_id=client_id,
             )
             if final:
-                _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
-                _schedule_broadcast(loop, {"type": "fetch_done", "state": final})
+                _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final, "client_id": client_id})
+                _schedule_broadcast(loop, {"type": "fetch_done", "state": final, "client_id": client_id})
             return
 
-        save_workspace_dataset(workspace_id, cities, timeline)
+        save_workspace_dataset(workspace_id, cities, timeline, client_id=client_id)
         try:
             save_snapshot(cities, timeline, keyword=keyword)
         except Exception:
             logger.exception("Snapshot save failed: workspace=%s job=%s", workspace_id, job_id)
 
-        clear_checkpoint(workspace_id)
+        clear_checkpoint(workspace_id, client_id=client_id)
 
         final = fetch_job_store.finish_job(
             job_id,
             status="completed",
             message=f"Veri cekimi tamamlandi: {len(cities)} sehir, {len(timeline)} satir",
             result={"cities": int(len(cities)), "timeline": int(len(timeline))},
+            client_id=client_id,
         )
         if final:
-            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
-            _schedule_broadcast(loop, {"type": "fetch_done", "state": final})
+            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final, "client_id": client_id})
+            _schedule_broadcast(loop, {"type": "fetch_done", "state": final, "client_id": client_id})
     except FetchCancelledError:
         logger.info("Fetch job cancelled: workspace=%s job=%s", workspace_id, job_id)
         final = fetch_job_store.update_job(
             job_id,
+            client_id=client_id,
             status="cancelled",
             phase="cancelled",
             message="Veri cekimi iptal edildi",
@@ -453,8 +489,8 @@ def _run_fetch_job(
             payload=last_resume_state,
         )
         if final:
-            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
-            _schedule_broadcast(loop, {"type": "fetch_cancelled", "state": final})
+            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final, "client_id": client_id})
+            _schedule_broadcast(loop, {"type": "fetch_cancelled", "state": final, "client_id": client_id})
     except Exception as exc:
         logger.exception("Fetch job failed: workspace=%s job=%s", workspace_id, job_id)
         message = f"Veri cekimi basarisiz: {exc}"
@@ -469,10 +505,11 @@ def _run_fetch_job(
             status="failed",
             message=message,
             error=str(exc),
+            client_id=client_id,
         )
         if final:
-            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final})
-            _schedule_broadcast(loop, {"type": "fetch_failed", "state": final})
+            _schedule_broadcast(loop, {"type": "fetch_job_update", "state": final, "client_id": client_id})
+            _schedule_broadcast(loop, {"type": "fetch_failed", "state": final, "client_id": client_id})
 
 
 def _download_city_timeline_for_workspace(
@@ -480,8 +517,9 @@ def _download_city_timeline_for_workspace(
     country: str,
     city: str,
     geo_code: str | None = None,
+    client_id: str | None = None,
 ) -> dict:
-    snapshot = fetch_job_store.snapshot()
+    snapshot = _fetch_job_snapshot(client_id)
     active = snapshot.get("active") or {}
     if active and active.get("status") in {"queued", "running", "cancelling"}:
         raise HTTPException(status_code=409, detail="Arkaplanda calisan bir veri cekimi varken manuel sehir cekimi yapilamaz.")
@@ -494,8 +532,8 @@ def _download_city_timeline_for_workspace(
     if not workspace_key or not country_key or not city_key:
         raise HTTPException(status_code=422, detail="workspace_id, country ve city zorunludur.")
 
-    meta = load_workspace_meta(workspace_key)
-    cities_df, timeline_df = load_workspace_dataset(workspace_key)
+    meta = load_workspace_meta(workspace_key, client_id=client_id)
+    cities_df, timeline_df = load_workspace_dataset(workspace_key, client_id=client_id)
     if cities_df.empty:
         raise HTTPException(status_code=409, detail="Once otomatik sehir skorlarini indirin.")
 
@@ -559,7 +597,7 @@ def _download_city_timeline_for_workspace(
     city_timeline["geo_code"] = resolved_geo
     merged_timeline = pd.concat([timeline_df, city_timeline[["country", "city", "geo_code", "date", "score"]]], ignore_index=True)
 
-    save_workspace_dataset(workspace_key, cities_df, merged_timeline)
+    save_workspace_dataset(workspace_key, cities_df, merged_timeline, client_id=client_id)
     try:
         save_snapshot(cities_df, merged_timeline, keyword=keyword)
     except Exception:
@@ -602,8 +640,9 @@ def _clean_country_keywords(mapping: dict[str, str], allowed: list[str]) -> dict
     return out
 
 
-def _workspace_payload(meta: dict) -> dict:
-    summary = workspace_summary(meta["id"])
+def _workspace_payload(meta: dict, client_id: str | None = None) -> dict:
+    summary = workspace_summary(meta["id"], client_id=client_id)
+    default_workspace_id = get_default_workspace_id(client_id)
     return {
         "id": meta["id"],
         "name": meta.get("name", meta["id"]),
@@ -614,7 +653,7 @@ def _workspace_payload(meta: dict) -> dict:
         "country_keywords": meta.get("country_keywords", {}),
         "dataset_rows": int(meta.get("dataset_rows", 0)),
         "updated_at": meta.get("updated_at", ""),
-        "is_default": meta["id"] == get_default_workspace_id(),
+        "is_default": meta["id"] == default_workspace_id,
         "stats": summary,
     }
 
@@ -703,9 +742,9 @@ def _geocode_cities(df: pd.DataFrame) -> pd.DataFrame:
     return work.merge(cache, on=["country", "city"], how="left")
 
 
-def _get_workspace_data(workspace_id: str, date_range: str, start: date | None, end: date | None) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
-    meta = load_workspace_meta(workspace_id)
-    cities, timeline = load_workspace_dataset(workspace_id)
+def _get_workspace_data(workspace_id: str, date_range: str, start: date | None, end: date | None, client_id: str | None = None) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+    meta = load_workspace_meta(workspace_id, client_id=client_id)
+    cities, timeline = load_workspace_dataset(workspace_id, client_id=client_id)
     if not timeline.empty:
         timeline = _filter_timeline(timeline, date_range, start, end)
     return meta, cities, timeline
@@ -729,9 +768,9 @@ def _country_summary(timeline: pd.DataFrame) -> pd.DataFrame:
     return country_summary
 
 
-def _empty_dashboard(meta: dict, message: str) -> dict:
+def _empty_dashboard(meta: dict, message: str, client_id: str | None = None) -> dict:
     return {
-        "workspace": _workspace_payload(meta),
+        "workspace": _workspace_payload(meta, client_id=client_id),
         "has_data": False,
         "message": message,
     }
@@ -1111,14 +1150,15 @@ def _render_raw(cities: pd.DataFrame, timeline: pd.DataFrame, search: str) -> di
 
 @app.get("/", response_class=HTMLResponse)
 async def workspace_home(request: Request) -> HTMLResponse:
-    default_workspace = ensure_default_workspace()
-    records = [_workspace_payload(item) for item in list_workspaces()]
+    client_id = _client_id_from_request(request)
+    default_workspace = ensure_default_workspace(client_id)
+    records = [_workspace_payload(item, client_id=client_id) for item in list_workspaces(client_id)]
     return templates.TemplateResponse(
         request,
         "workspace.html",
         {
             "request": request,
-            "default_workspace_id": get_default_workspace_id() or default_workspace["id"],
+            "default_workspace_id": get_default_workspace_id(client_id) or default_workspace["id"],
             "workspaces": records,
             "countries": ALL_COUNTRIES,
         },
@@ -1127,14 +1167,15 @@ async def workspace_home(request: Request) -> HTMLResponse:
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    default_workspace = ensure_default_workspace()
-    records = [_workspace_payload(item) for item in list_workspaces()]
+    client_id = _client_id_from_request(request)
+    default_workspace = ensure_default_workspace(client_id)
+    records = [_workspace_payload(item, client_id=client_id) for item in list_workspaces(client_id)]
     return templates.TemplateResponse(
         request,
         "index.html",
         {
             "request": request,
-            "default_workspace_id": get_default_workspace_id() or default_workspace["id"],
+            "default_workspace_id": get_default_workspace_id(client_id) or default_workspace["id"],
             "workspaces": records,
             "countries": ALL_COUNTRIES,
         },
@@ -1147,37 +1188,41 @@ async def health() -> dict:
 
 
 @app.get("/api/workspaces")
-async def api_workspaces() -> dict:
-    records = [_workspace_payload(item) for item in list_workspaces()]
-    return {"items": records, "default_workspace_id": get_default_workspace_id()}
+async def api_workspaces(request: Request) -> dict:
+    client_id = _client_id_from_request(request)
+    records = [_workspace_payload(item, client_id=client_id) for item in list_workspaces(client_id)]
+    return {"items": records, "default_workspace_id": get_default_workspace_id(client_id)}
 
 
 @app.get("/api/browser-state")
-async def api_browser_state_export() -> dict:
+async def api_browser_state_export(request: Request) -> dict:
+    client_id = _client_id_from_request(request)
     return {
-        "workspace": export_memory_state(),
-        "checkpoints": export_resume_state(),
-        "fetch_job": fetch_job_store.export_state(),
+        "workspace": export_memory_state(client_id),
+        "checkpoints": export_resume_state(client_id),
+        "fetch_job": fetch_job_store.export_state(client_id),
     }
 
 
 @app.post("/api/browser-state")
-async def api_browser_state_import(payload: BrowserStatePayload) -> dict:
-    reset_memory_state()
+async def api_browser_state_import(request: Request, payload: BrowserStatePayload) -> dict:
+    client_id = _client_id_from_request(request)
+    reset_memory_state(client_id)
     import_memory_state({
         "workspaces": payload.workspaces or [],
         "default_workspace_id": payload.default_workspace_id,
         "datasets": payload.datasets or {},
-    })
-    import_resume_state(payload.checkpoints or {})
-    fetch_job_store.import_state(payload.fetch_job or {})
+    }, client_id=client_id)
+    import_resume_state(payload.checkpoints or {}, client_id=client_id)
+    fetch_job_store.import_state(payload.fetch_job or {}, client_id=client_id)
     return {"ok": True}
 
 
 @app.post("/api/workspaces")
-async def api_create_workspace(payload: WorkspaceCreate) -> dict:
+async def api_create_workspace(request: Request, payload: WorkspaceCreate) -> dict:
+    client_id = _client_id_from_request(request)
     try:
-        created = create_workspace(name=payload.name, keyword=payload.keyword, countries=payload.countries)
+        created = create_workspace(name=payload.name, keyword=payload.keyword, countries=payload.countries, client_id=client_id)
         updated = update_workspace(
             created["id"],
             name=payload.name,
@@ -1186,17 +1231,19 @@ async def api_create_workspace(payload: WorkspaceCreate) -> dict:
             countries=payload.countries,
             use_topic_mode=payload.use_topic_mode,
             country_keywords=_clean_country_keywords(payload.country_keywords, payload.countries),
+            client_id=client_id,
         )
     except WorkspaceValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    await hub.broadcast({"type": "workspace_created", "workspace_id": updated["id"]})
+    await hub.broadcast({"type": "workspace_created", "workspace_id": updated["id"], "client_id": client_id})
     return {"item": _workspace_payload(updated)}
 
 
 @app.patch("/api/workspaces/{workspace_id}")
-async def api_update_workspace(workspace_id: str, payload: WorkspaceUpdate) -> dict:
-    meta = load_workspace_meta(workspace_id)
+async def api_update_workspace(request: Request, workspace_id: str, payload: WorkspaceUpdate) -> dict:
+    client_id = _client_id_from_request(request)
+    meta = load_workspace_meta(workspace_id, client_id=client_id)
     if (
         payload.name is None
         and payload.keyword is None
@@ -1206,10 +1253,10 @@ async def api_update_workspace(workspace_id: str, payload: WorkspaceUpdate) -> d
         and payload.country_keywords is None
     ):
         if payload.is_default:
-            set_default_workspace(workspace_id)
-        await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id})
-        refreshed = load_workspace_meta(workspace_id)
-        return {"item": _workspace_payload(refreshed)}
+            set_default_workspace(workspace_id, client_id=client_id)
+        await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id, "client_id": client_id})
+        refreshed = load_workspace_meta(workspace_id, client_id=client_id)
+        return {"item": _workspace_payload(refreshed, client_id=client_id)}
 
     countries = payload.countries if payload.countries is not None else list(meta.get("countries") or TOP_20_COUNTRIES)
     country_keywords = payload.country_keywords if payload.country_keywords is not None else dict(meta.get("country_keywords") or {})
@@ -1224,33 +1271,37 @@ async def api_update_workspace(workspace_id: str, payload: WorkspaceUpdate) -> d
             countries=countries,
             use_topic_mode=payload.use_topic_mode if payload.use_topic_mode is not None else bool(meta.get("use_topic_mode", False)),
             country_keywords=country_keywords,
+            client_id=client_id,
         )
     except WorkspaceValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     if payload.is_default:
-        set_default_workspace(workspace_id)
-    await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id})
-    return {"item": _workspace_payload(updated)}
+        set_default_workspace(workspace_id, client_id=client_id)
+    await hub.broadcast({"type": "workspace_updated", "workspace_id": workspace_id, "client_id": client_id})
+    return {"item": _workspace_payload(updated, client_id=client_id)}
 
 
 @app.delete("/api/workspaces/{workspace_id}")
-async def api_delete_workspace(workspace_id: str) -> dict:
-    delete_workspace(workspace_id)
-    await hub.broadcast({"type": "workspace_deleted", "workspace_id": workspace_id})
+async def api_delete_workspace(request: Request, workspace_id: str) -> dict:
+    client_id = _client_id_from_request(request)
+    delete_workspace(workspace_id, client_id=client_id)
+    await hub.broadcast({"type": "workspace_deleted", "workspace_id": workspace_id, "client_id": client_id})
     return {"ok": True}
 
 
 @app.post("/api/cache/clear")
-async def api_clear_cache() -> dict:
+async def api_clear_cache(request: Request) -> dict:
+    client_id = _client_id_from_request(request)
     count = clear_cache()
-    await hub.broadcast({"type": "cache_cleared", "count": count})
+    await hub.broadcast({"type": "cache_cleared", "count": count, "client_id": client_id})
     return {"ok": True, "deleted": count}
 
 
 @app.post("/api/fetch")
-async def api_fetch(payload: FetchRequest) -> JSONResponse:
-    meta = load_workspace_meta(payload.workspace_id)
+async def api_fetch(request: Request, payload: FetchRequest) -> JSONResponse:
+    client_id = _client_id_from_request(request)
+    meta = load_workspace_meta(payload.workspace_id, client_id=client_id)
     resume_requested = bool(payload.resume)
     keyword = str(meta.get("keyword") or DEFAULT_KEYWORD).strip() or DEFAULT_KEYWORD
     countries = list(meta.get("countries") or TOP_20_COUNTRIES)
@@ -1268,12 +1319,13 @@ async def api_fetch(payload: FetchRequest) -> JSONResponse:
             language=language,
             country_keywords=clean_country_keywords,
             resume_requested=resume_requested,
+            client_id=client_id,
         )
     except JobConflictError as exc:
         return JSONResponse(status_code=409, content={"ok": False, "detail": "Bu anda baska bir veri cekimi calisiyor", "job": exc.active_job})
 
-    await hub.broadcast({"type": "fetch_job_update", "state": job})
-    await hub.broadcast({"type": "fetch_started", "state": job})
+    await hub.broadcast({"type": "fetch_job_update", "state": job, "client_id": client_id})
+    await hub.broadcast({"type": "fetch_started", "state": job, "client_id": client_id})
 
     loop = asyncio.get_running_loop()
     worker = threading.Thread(
@@ -1288,6 +1340,7 @@ async def api_fetch(payload: FetchRequest) -> JSONResponse:
             "use_topic_mode": use_topic_mode,
             "country_keywords": clean_country_keywords,
             "resume_requested": resume_requested,
+            "client_id": client_id,
         },
         daemon=True,
     )
@@ -1297,8 +1350,9 @@ async def api_fetch(payload: FetchRequest) -> JSONResponse:
 
 
 @app.post("/api/fetch/cancel")
-async def api_fetch_cancel(payload: FetchCancelRequest) -> JSONResponse:
-    snapshot = fetch_job_store.snapshot()
+async def api_fetch_cancel(request: Request, payload: FetchCancelRequest) -> JSONResponse:
+    client_id = _client_id_from_request(request)
+    snapshot = _fetch_job_snapshot(client_id)
     active = snapshot.get("active") or {}
     if not active or active.get("status") not in {"queued", "running", "cancelling"}:
         return JSONResponse(status_code=409, content={"ok": False, "detail": "Iptal edilecek aktif bir cekim yok"})
@@ -1307,35 +1361,38 @@ async def api_fetch_cancel(payload: FetchCancelRequest) -> JSONResponse:
     if workspace_id and active.get("workspace_id") != workspace_id:
         return JSONResponse(status_code=409, content={"ok": False, "detail": "Bu workspace icin aktif cekim yok", "job": active})
 
-    updated = fetch_job_store.request_cancel(str(active.get("job_id") or ""))
+    updated = fetch_job_store.request_cancel(str(active.get("job_id") or ""), client_id=client_id)
     if not updated:
         return JSONResponse(status_code=409, content={"ok": False, "detail": "Iptal istegi uygulanamadi"})
 
-    await hub.broadcast({"type": "fetch_job_update", "state": updated})
-    await hub.broadcast({"type": "fetch_cancel_requested", "state": updated})
+    await hub.broadcast({"type": "fetch_job_update", "state": updated, "client_id": client_id})
+    await hub.broadcast({"type": "fetch_cancel_requested", "state": updated, "client_id": client_id})
     return JSONResponse(status_code=200, content={"ok": True, "job": updated})
 
 
 @app.get("/api/fetch/status")
-async def api_fetch_status() -> dict:
-    return fetch_job_store.snapshot()
+async def api_fetch_status(request: Request) -> dict:
+    client_id = _client_id_from_request(request)
+    return _fetch_job_snapshot(client_id)
 
 
 @app.get("/api/dashboard/overview")
 async def api_dashboard_overview(
+    request: Request,
     workspace_id: str = Query(...),
     range: str = Query("all"),
     start: date | None = Query(None),
     end: date | None = Query(None),
     country: str | None = Query(None),
 ) -> dict:
-    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    client_id = _client_id_from_request(request)
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end, client_id)
     if cities.empty or timeline.empty:
-        return _empty_dashboard(meta, "No data yet. Run fetch to create the first dataset.")
+        return _empty_dashboard(meta, "No data yet. Run fetch to create the first dataset.", client_id=client_id)
 
     country_summary = _country_summary(timeline)
     if country_summary.empty:
-        return _empty_dashboard(meta, "No country data in selected date range")
+        return _empty_dashboard(meta, "No country data in selected date range", client_id=client_id)
 
     selected_country = country if country and country in country_summary["country"].tolist() else str(country_summary.iloc[0]["country"])
 
@@ -1353,7 +1410,7 @@ async def api_dashboard_overview(
     world = await asyncio.to_thread(_render_world_charts, country_summary, cities, selected_country)
 
     return {
-        "workspace": _workspace_payload(meta),
+        "workspace": _workspace_payload(meta, client_id=client_id),
         "has_data": True,
         "selected_country": selected_country,
         "country_options": country_summary[["country", "country_name", "avg_score", "iso3"]].to_dict(orient="records"),
@@ -1364,22 +1421,25 @@ async def api_dashboard_overview(
 
 @app.get("/api/dashboard/country")
 async def api_dashboard_country(
+    request: Request,
     workspace_id: str = Query(...),
     country: str = Query(...),
     range: str = Query("all"),
     start: date | None = Query(None),
     end: date | None = Query(None),
 ) -> dict:
-    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    client_id = _client_id_from_request(request)
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end, client_id)
     if cities.empty or timeline.empty:
-        return _empty_dashboard(meta, "No data")
+        return _empty_dashboard(meta, "No data", client_id=client_id)
 
     result = await asyncio.to_thread(_render_country_analysis, timeline, country)
-    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+    return {"workspace": _workspace_payload(meta, client_id=client_id), "has_data": True, **result}
 
 
 @app.get("/api/dashboard/city")
 async def api_dashboard_city(
+    request: Request,
     workspace_id: str = Query(...),
     country: str = Query(...),
     city: str | None = Query(None),
@@ -1388,22 +1448,25 @@ async def api_dashboard_city(
     start: date | None = Query(None),
     end: date | None = Query(None),
 ) -> dict:
-    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    client_id = _client_id_from_request(request)
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end, client_id)
     if cities.empty:
-        return _empty_dashboard(meta, "No city score data yet. Run fetch first.")
+        return _empty_dashboard(meta, "No city score data yet. Run fetch first.", client_id=client_id)
 
     result = await asyncio.to_thread(_render_city_analysis, timeline, cities, country, city, geo_code)
-    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+    return {"workspace": _workspace_payload(meta, client_id=client_id), "has_data": True, **result}
 
 
 @app.post("/api/fetch/city-timeline")
-async def api_fetch_city_timeline(payload: CityTimelineFetchRequest) -> dict:
+async def api_fetch_city_timeline(request: Request, payload: CityTimelineFetchRequest) -> dict:
+    client_id = _client_id_from_request(request)
     result = await asyncio.to_thread(
         _download_city_timeline_for_workspace,
         payload.workspace_id,
         payload.country,
         payload.city,
         payload.geo_code,
+        client_id,
     )
 
     if not result.get("ok") and result.get("status") == "empty":
@@ -1413,49 +1476,55 @@ async def api_fetch_city_timeline(payload: CityTimelineFetchRequest) -> dict:
 
 
 @app.get("/api/dashboard/hourly")
-async def api_dashboard_hourly(workspace_id: str = Query(...), country: str = Query(...)) -> dict:
-    meta = load_workspace_meta(workspace_id)
+async def api_dashboard_hourly(request: Request, workspace_id: str = Query(...), country: str = Query(...)) -> dict:
+    client_id = _client_id_from_request(request)
+    meta = load_workspace_meta(workspace_id, client_id=client_id)
     keyword = str(meta.get("keyword") or DEFAULT_KEYWORD)
     result = await asyncio.to_thread(_render_hourly, keyword, country)
-    return {"workspace": _workspace_payload(meta), **result}
+    return {"workspace": _workspace_payload(meta, client_id=client_id), **result}
 
 
 @app.get("/api/dashboard/ranking")
 async def api_dashboard_ranking(
+    request: Request,
     workspace_id: str = Query(...),
     compare: str | None = Query(None),
     range: str = Query("all"),
     start: date | None = Query(None),
     end: date | None = Query(None),
 ) -> dict:
-    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    client_id = _client_id_from_request(request)
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end, client_id)
     if cities.empty or timeline.empty:
-        return _empty_dashboard(meta, "No data")
+        return _empty_dashboard(meta, "No data", client_id=client_id)
 
     compare_list = [x.strip().upper() for x in (compare or "").split(",") if x.strip()]
     result = await asyncio.to_thread(_render_ranking, timeline, compare_list)
-    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+    return {"workspace": _workspace_payload(meta, client_id=client_id), "has_data": True, **result}
 
 
 @app.get("/api/dashboard/raw")
 async def api_dashboard_raw(
+    request: Request,
     workspace_id: str = Query(...),
     search: str = Query(""),
     range: str = Query("all"),
     start: date | None = Query(None),
     end: date | None = Query(None),
 ) -> dict:
-    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    client_id = _client_id_from_request(request)
+    meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end, client_id)
     if cities.empty or timeline.empty:
-        return _empty_dashboard(meta, "No data")
+        return _empty_dashboard(meta, "No data", client_id=client_id)
 
     result = await asyncio.to_thread(_render_raw, cities, timeline, search)
-    return {"workspace": _workspace_payload(meta), "has_data": True, **result}
+    return {"workspace": _workspace_payload(meta, client_id=client_id), "has_data": True, **result}
 
 
 @app.get("/api/dashboard/related")
-async def api_dashboard_related(workspace_id: str = Query(...), country: str = Query(...)) -> dict:
-    meta = load_workspace_meta(workspace_id)
+async def api_dashboard_related(request: Request, workspace_id: str = Query(...), country: str = Query(...)) -> dict:
+    client_id = _client_id_from_request(request)
+    meta = load_workspace_meta(workspace_id, client_id=client_id)
     keyword = str(meta.get("keyword") or DEFAULT_KEYWORD)
     cfg = FetchConfig(keyword=keyword, hl="tr-TR")
 
@@ -1468,7 +1537,7 @@ async def api_dashboard_related(workspace_id: str = Query(...), country: str = Q
         rt = {"top": pd.DataFrame(), "rising": pd.DataFrame()}
 
     return {
-        "workspace": _workspace_payload(meta),
+        "workspace": _workspace_payload(meta, client_id=client_id),
         "country": country,
         "queries": {
             "top": rq["top"].to_dict(orient="records") if not rq["top"].empty else [],
@@ -1483,13 +1552,15 @@ async def api_dashboard_related(workspace_id: str = Query(...), country: str = Q
 
 @app.get("/api/export/csv")
 async def api_export_csv(
+    request: Request,
     workspace_id: str = Query(...),
     dataset: str = Query("city"),
     range: str = Query("all"),
     start: date | None = Query(None),
     end: date | None = Query(None),
 ) -> StreamingResponse:
-    _meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end)
+    client_id = _client_id_from_request(request)
+    _meta, cities, timeline = await asyncio.to_thread(_get_workspace_data, workspace_id, range, start, end, client_id)
 
     if dataset == "city":
         content = export_csv(cities)
@@ -1509,7 +1580,8 @@ async def api_export_csv(
 
 @app.websocket("/ws/status")
 async def ws_status(ws: WebSocket) -> None:
-    await hub.connect(ws)
+    client_id = _client_id_from_request(ws)
+    await hub.connect(ws, client_id=client_id)
     await ws.send_json({"type": "connected"})
     try:
         while True:

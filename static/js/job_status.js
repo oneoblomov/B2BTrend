@@ -1,6 +1,8 @@
 (function () {
   const STATUS_URL = "/api/fetch/status";
   const CANCEL_URL = "/api/fetch/cancel";
+  const API_CACHE_PREFIX = "b2btrend-api-cache:";
+  const STATUS_CACHE_KEY = `${API_CACHE_PREFIX}${STATUS_URL}`;
   const NOTIFICATION_STORAGE_KEY = "b2btrend-notifications";
   const MAX_NOTIFICATIONS = 30;
   const POLL_MS = 4000;
@@ -617,10 +619,20 @@
   async function syncSnapshot(source = "poll") {
     try {
       const response = await fetch(STATUS_URL, { cache: "no-store" });
-      if (!response.ok) return;
+      if (!response.ok) throw new Error("status fetch failed");
       const payload = await response.json();
+      window.B2BTrendStorage?.set(STATUS_CACHE_KEY, payload).catch(() => {});
       emitSnapshot(payload, source);
     } catch (_error) {
+      try {
+        const cached = await window.B2BTrendStorage?.get(STATUS_CACHE_KEY);
+        if (cached) {
+          emitSnapshot(cached, source);
+          return;
+        }
+      } catch (_cacheError) {
+        return;
+      }
       return;
     }
   }
@@ -640,6 +652,10 @@
       try {
         payload = JSON.parse(event.data);
       } catch (_error) {
+        return;
+      }
+
+      if (payload?.client_id && payload.client_id !== window.B2BTrendStorage?.clientId) {
         return;
       }
 

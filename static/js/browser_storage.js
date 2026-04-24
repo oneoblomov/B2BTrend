@@ -2,8 +2,52 @@
   const DB_NAME = "b2btrend-browser-storage";
   const DB_VERSION = 1;
   const STORE_NAME = "kv";
+  const CLIENT_ID_KEY = "b2btrend-client-id";
 
   const memoryStore = new Map();
+
+  function generateClientId() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+    return `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  function readStoredClientId() {
+    try {
+      const stored = window.localStorage?.getItem(CLIENT_ID_KEY);
+      if (stored && stored.trim()) {
+        return stored.trim();
+      }
+    } catch (_error) {
+      // fall through to cookie lookup
+    }
+
+    const cookieMatch = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith(`${CLIENT_ID_KEY}=`));
+    if (cookieMatch) {
+      const value = cookieMatch.slice(CLIENT_ID_KEY.length + 1);
+      if (value.trim()) {
+        return decodeURIComponent(value.trim());
+      }
+    }
+
+    return "";
+  }
+
+  function persistClientId(clientId) {
+    try {
+      window.localStorage?.setItem(CLIENT_ID_KEY, clientId);
+    } catch (_error) {
+      // ignore localStorage failures; the cookie still scopes requests
+    }
+    document.cookie = `${CLIENT_ID_KEY}=${encodeURIComponent(clientId)}; path=/; max-age=31536000; samesite=lax`;
+  }
+
+  const clientId = readStoredClientId() || generateClientId();
+  persistClientId(clientId);
 
   function openDatabase() {
     return new Promise((resolve) => {
@@ -107,5 +151,6 @@
     set,
     delete: remove,
     getAll,
+    clientId,
   };
 })();
