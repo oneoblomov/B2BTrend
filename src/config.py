@@ -553,9 +553,7 @@ def _migrate_file(source: Path, target: Path) -> None:
 
 
 def _migrate_legacy_storage() -> None:
-    _migrate_file(LEGACY_CITIES_CSV, DEFAULT_CITIES_CSV)
-    _migrate_file(LEGACY_TIMELINE_CSV, DEFAULT_TIMELINE_CSV)
-    _migrate_file(LEGACY_GEOCACHE_FILE, GEOCACHE_FILE)
+    return
 
 
 _migrate_legacy_storage()

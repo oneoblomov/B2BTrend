@@ -3,16 +3,13 @@ const seedWorkspaces = JSON.parse(root.dataset.workspaces || "[]");
 const defaultWorkspaceId = root.dataset.defaultWorkspace || "";
 const THEME_KEY = "b2btrend-theme";
 const LAST_WORKSPACE_KEY = "b2btrend-last-workspace";
+const BROWSER_STATE_KEY = "b2btrend-browser-state";
 
 function resolveWorkspaceId(candidate, availableWorkspaces = seedWorkspaces) {
   if (candidate && availableWorkspaces.some((item) => item.id === candidate)) {
     return candidate;
   }
 
-  const stored = localStorage.getItem(LAST_WORKSPACE_KEY);
-  if (stored && availableWorkspaces.some((item) => item.id === stored)) {
-    return stored;
-  }
 
   return defaultWorkspaceId || (availableWorkspaces[0] ? availableWorkspaces[0].id : "");
 }
@@ -392,8 +389,8 @@ function applyTheme(theme) {
   syncChartTheme();
 }
 
-function initTheme() {
-  const saved = localStorage.getItem(THEME_KEY) || "system";
+async function initTheme() {
+  const saved = (await getStoredValue(THEME_KEY)) || "system";
   applyTheme(saved);
 
   if (prefersColorScheme) {
@@ -454,6 +451,43 @@ async function getJSON(path, params = {}) {
   return res.json();
 }
 
+async function getStoredValue(key) {
+  try {
+    return await window.B2BTrendStorage?.get(key);
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function importBrowserState() {
+  const payload = await getStoredValue(BROWSER_STATE_KEY);
+  if (!payload) return;
+
+  const importPayload = {
+    workspaces: payload.workspace?.workspaces || payload.workspaces || [],
+    default_workspace_id: payload.workspace?.default_workspace_id || payload.default_workspace_id || "",
+    datasets: payload.workspace?.datasets || payload.datasets || {},
+    checkpoints: payload.checkpoints || {},
+    fetch_job: payload.fetch_job || {},
+  };
+
+  const res = await fetch("/api/browser-state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(importPayload),
+  });
+
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+}
+
+async function persistBrowserState() {
+  const payload = await getJSON("/api/browser-state");
+  await window.B2BTrendStorage?.set(BROWSER_STATE_KEY, payload);
+  return payload;
+}
+
 async function loadWorkspaces() {
   const payload = await getJSON("/api/workspaces");
   state.workspaces = payload.items || [];
@@ -465,7 +499,7 @@ async function loadWorkspaces() {
   }
 
   if (state.selectedWorkspaceId) {
-    localStorage.setItem(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
+    await window.B2BTrendStorage?.set(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
   }
 
   setSelectOptions(
@@ -506,7 +540,6 @@ async function loadOverview() {
   state.countryOptions = payload.country_options || [];
   renderMetrics(payload.metrics);
   syncCountrySelectors(payload.country_options || []);
-
   plot("chart-world", payload.charts.world);
   plot("chart-drill", payload.charts.drill_city);
   plot("chart-world-city", payload.charts.world_city);
@@ -678,6 +711,7 @@ async function fetchCityTimeline() {
     writeUrlState();
 
     notify(payload.message || "Sehir zaman serisi kaydedildi");
+    await persistBrowserState().catch(() => {});
     await loadOverview();
   } catch (err) {
     notify(`Hata: ${err.message}`);
@@ -772,6 +806,7 @@ async function fetchDataset() {
       throw new Error(payload.detail || "Fetch error");
     }
     notify("Veri cekimi arkaplanda baslatildi");
+    await persistBrowserState().catch(() => {});
   } catch (err) {
     notify(`Hata: ${err.message}`);
     setFetchButtonState(false, "Veri Cek");
@@ -794,10 +829,12 @@ function handleRealtimeEvent(event) {
 
   if (payload.type === "workspace_created" || payload.type === "workspace_updated" || payload.type === "workspace_deleted") {
     loadWorkspaces().catch(() => {});
+    persistBrowserState().catch(() => {});
   }
 
   if (payload.type === "cache_cleared") {
     notify("Cache temizlendi");
+    persistBrowserState().catch(() => {});
   }
 }
 
@@ -835,6 +872,7 @@ async function handleJobSnapshot(snapshot, source = "event") {
       if (job.status === "completed") {
         await loadWorkspaces();
         await loadOverview();
+        await persistBrowserState().catch(() => {});
       }
     } else if (source === "event") {
       await loadWorkspaces();
@@ -843,6 +881,10 @@ async function handleJobSnapshot(snapshot, source = "event") {
 
   if (job.status === "cancelled") {
     setFetchButtonState(false, "Veri Cek");
+  }
+
+  if (source !== "bootstrap") {
+    persistBrowserState().catch(() => {});
   }
 }
 
@@ -873,10 +915,11 @@ async function createWorkspaceFromDialog(event) {
   }
 
   state.selectedWorkspaceId = payload.item.id;
-  localStorage.setItem(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
+  await window.B2BTrendStorage?.set(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
   el.wsDialog.close();
   await loadWorkspaces();
   await loadOverview();
+  await persistBrowserState().catch(() => {});
   notify("Workspace olusturuldu");
 }
 
@@ -931,7 +974,7 @@ function bindEvents() {
   if (el.workspaceSelect) {
     el.workspaceSelect.addEventListener("change", async (e) => {
       state.selectedWorkspaceId = e.target.value;
-      localStorage.setItem(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
+      await window.B2BTrendStorage?.set(LAST_WORKSPACE_KEY, state.selectedWorkspaceId);
       state.selectedCountry = "";
       state.selectedCity = "";
       state.selectedGeoCode = "";
@@ -1052,7 +1095,7 @@ function bindEvents() {
     el.themeButtons.forEach((btn) => {
       btn.addEventListener("click", (e) => {
         const mode = e.currentTarget.dataset.theme || "system";
-        localStorage.setItem(THEME_KEY, mode);
+        window.B2BTrendStorage?.set(THEME_KEY, mode).catch(() => {});
         applyTheme(mode);
       });
     });
@@ -1062,15 +1105,23 @@ function bindEvents() {
 }
 
 (async function bootstrap() {
-  initTheme();
+  await window.B2BTrendStorage?.ready;
+  await initTheme();
   toggleCountryKeywordInput();
   readUrlState();
+
+  try {
+    await importBrowserState();
+  } catch (_error) {
+    // IndexedDB state may be empty or stale; continue with the server state.
+  }
 
   const hasWorkspaceQuery = new URLSearchParams(window.location.search).has("ws");
   if (hasWorkspaceQuery) {
     state.selectedWorkspaceId = resolveWorkspaceId(state.selectedWorkspaceId);
   } else {
-    state.selectedWorkspaceId = resolveWorkspaceId(localStorage.getItem(LAST_WORKSPACE_KEY) || "");
+    const storedWorkspaceId = await getStoredValue(LAST_WORKSPACE_KEY);
+    state.selectedWorkspaceId = resolveWorkspaceId(storedWorkspaceId || "");
   }
 
   bindEvents();
@@ -1105,6 +1156,8 @@ function bindEvents() {
   } catch (err) {
     notify(`Baslatma hatasi: ${err.message}`, "warning", false);
   }
+
+  persistBrowserState().catch(() => {});
 
   activateTab(state.activeTab || "tab-map");
 })();

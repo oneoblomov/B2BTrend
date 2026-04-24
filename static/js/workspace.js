@@ -113,8 +113,13 @@ function applyTheme(theme) {
 }
 
 function initTheme() {
-  const saved = localStorage.getItem(THEME_KEY) || "system";
-  applyTheme(saved);
+  window.B2BTrendStorage?.ready?.then(() => {
+    window.B2BTrendStorage?.get(THEME_KEY).then((saved) => {
+      applyTheme(saved || "system");
+    }).catch(() => {
+      applyTheme("system");
+    });
+  });
 }
 
 function toggleCountryKeywordsInput() {
@@ -247,7 +252,7 @@ async function saveForm(event) {
 
   dialog.close();
   if (savedWorkspaceId) {
-    localStorage.setItem(LAST_WORKSPACE_KEY, savedWorkspaceId);
+    window.B2BTrendStorage?.set(LAST_WORKSPACE_KEY, savedWorkspaceId).catch(() => {});
   }
   await getWorkspaces();
 }
@@ -333,7 +338,7 @@ if (themeButtons && themeButtons.length > 0) {
   themeButtons.forEach((btn) => {
     btn.addEventListener("click", (e) => {
       const mode = e.currentTarget.dataset.theme || "system";
-      localStorage.setItem(THEME_KEY, mode);
+        window.B2BTrendStorage?.set(THEME_KEY, mode).catch(() => {});
       applyTheme(mode);
     });
   });
@@ -343,7 +348,9 @@ window.addEventListener("b2btrend:realtime", handleRealtimeEvent);
 window.addEventListener("b2btrend:job-final", handleJobFinal);
 
 (async function bootstrap() {
-  initTheme();
+  await window.B2BTrendStorage?.ready;
+  const storedTheme = await window.B2BTrendStorage?.get(THEME_KEY);
+  applyTheme(storedTheme || "system");
   render();
   await getWorkspaces();
 })();

@@ -348,12 +348,8 @@ def _cache_get(key: str, ttl_hours: int) -> pd.DataFrame | None:
 
 
 def _cache_set(key: str, df: pd.DataFrame) -> None:
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(_cache_path(key), index=False)
-        _prune_files(CACHE_DIR, "*.parquet", MAX_CACHE_FILES)
-    except Exception:
-        pass
+    del key, df
+    return
 
 
 def _prune_files(directory: Path, pattern: str, keep: int) -> None:
@@ -365,15 +361,8 @@ def _prune_files(directory: Path, pattern: str, keep: int) -> None:
 
 
 def _write_dataset_metadata(keyword: str, countries: Iterable[str], cities_df: pd.DataFrame, timeline_df: pd.DataFrame) -> None:
-    payload = {
-        "keyword": keyword,
-        "countries": list(countries),
-        "city_rows": int(len(cities_df)),
-        "timeline_rows": int(len(timeline_df)),
-        "updated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    DATASET_META_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DATASET_META_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    del keyword, countries, cities_df, timeline_df
+    return
 
 
 # ── Tekil Çekme Fonksiyonları ─────────────────────────────────
@@ -1191,46 +1180,9 @@ def save_snapshot(
     root: str | Path | None = None,
     keyword: str = "",
 ) -> tuple[Path, Path]:
-    """Persist the single active dataset and its metadata."""
-    del root
-
-    cities_path = DEFAULT_CITIES_CSV
-    timeline_path = DEFAULT_TIMELINE_CSV
-
-    cities_path.parent.mkdir(parents=True, exist_ok=True)
-    cities_df.to_csv(cities_path, index=False)
-    timeline_df.to_csv(timeline_path, index=False)
-    _write_dataset_metadata(
-        keyword=keyword or DEFAULT_KEYWORD,
-        countries=sorted(cities_df["country"].dropna().astype(str).unique().tolist()) if not cities_df.empty else [],
-        cities_df=cities_df,
-        timeline_df=timeline_df,
-    )
-
-    if SAVE_REPORT_HISTORY:
-        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-        manifest = REPORTS_DIR / "latest_dataset.json"
-        manifest.write_text(
-            json.dumps(
-                {
-                    "keyword": keyword or DEFAULT_KEYWORD,
-                    "cities_file": str(cities_path.relative_to(cities_path.parent.parent.parent)),
-                    "timeline_file": str(timeline_path.relative_to(timeline_path.parent.parent.parent)),
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        _prune_files(REPORTS_DIR, "*.json", max(1, MAX_REPORT_FILES))
-
-    return cities_path, timeline_path
+    del cities_df, timeline_df, root, keyword
+    return Path("browser://dataset/cities.csv"), Path("browser://dataset/timeline.csv")
 
 
 def clear_cache() -> int:
-    """Cache dosyalarını temizler. Silinen dosya sayısını döner."""
-    count = 0
-    for f in CACHE_DIR.glob("*.parquet"):
-        f.unlink(missing_ok=True)
-        count += 1
-    return count
+    return 0

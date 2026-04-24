@@ -2,25 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from src.config import DATA_DIR
-
-WORKSPACES_DIR = DATA_DIR / "workspaces"
-CHECKPOINT_FILE_NAME = "fetch_checkpoint.json"
 LOCK = threading.RLock()
-
-
-def _workspace_dir(workspace_id: str) -> Path:
-    return WORKSPACES_DIR / str(workspace_id).strip()
-
-
-def checkpoint_path(workspace_id: str) -> Path:
-    return _workspace_dir(workspace_id) / CHECKPOINT_FILE_NAME
+_CHECKPOINTS: dict[str, dict[str, Any]] = {}
 
 
 def build_fetch_fingerprint(
@@ -42,47 +29,44 @@ def build_fetch_fingerprint(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
-    tmp.write_text(serialized, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def load_checkpoint(workspace_id: str) -> dict[str, Any] | None:
-    path = checkpoint_path(workspace_id)
     with LOCK:
-        if not path.exists():
+        payload = _CHECKPOINTS.get(str(workspace_id).strip())
+        if not isinstance(payload, dict):
             return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
-    if not isinstance(payload, dict):
-        return None
-    payload["workspace_id"] = str(payload.get("workspace_id") or workspace_id)
-    return payload
+        return dict(payload)
 
 
 def save_checkpoint(workspace_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    path = checkpoint_path(workspace_id)
     checkpoint = dict(payload or {})
     checkpoint["workspace_id"] = workspace_id
     checkpoint["updated_at"] = datetime.now().isoformat(timespec="seconds")
     with LOCK:
-        _write_json_atomic(path, checkpoint)
+        _CHECKPOINTS[str(workspace_id).strip()] = dict(checkpoint)
     return checkpoint
 
 
 def clear_checkpoint(workspace_id: str) -> None:
-    path = checkpoint_path(workspace_id)
     with LOCK:
-        path.unlink(missing_ok=True)
+        _CHECKPOINTS.pop(str(workspace_id).strip(), None)
 
 
 def is_checkpoint_compatible(checkpoint: dict[str, Any] | None, fingerprint: str) -> bool:
     if not isinstance(checkpoint, dict):
         return False
     return str(checkpoint.get("fingerprint") or "").strip() == str(fingerprint).strip()
+
+
+def export_state() -> dict[str, Any]:
+    with LOCK:
+        return {key: dict(value) for key, value in _CHECKPOINTS.items()}
+
+
+def import_state(payload: dict[str, Any] | None) -> None:
+    with LOCK:
+        _CHECKPOINTS.clear()
+        if not isinstance(payload, dict):
+            return
+        for workspace_id, checkpoint in payload.items():
+            if isinstance(checkpoint, dict):
+                _CHECKPOINTS[str(workspace_id).strip()] = dict(checkpoint)

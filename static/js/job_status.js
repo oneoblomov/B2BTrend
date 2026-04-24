@@ -31,7 +31,7 @@
     pollTimer: null,
     notificationTicker: null,
     lastSignature: "",
-    notifications: loadNotifications(),
+    notifications: [],
     panelOpen: false,
   };
 
@@ -129,9 +129,10 @@
     return job.status && ACTIVE_STATUSES.has(job.status) ? 0.12 : 1;
   }
 
-  function loadNotifications() {
+  async function loadNotifications() {
+    await window.B2BTrendStorage?.ready;
     try {
-      const raw = window.localStorage.getItem(NOTIFICATION_STORAGE_KEY);
+      const raw = await window.B2BTrendStorage?.get(NOTIFICATION_STORAGE_KEY);
       const parsed = raw ? JSON.parse(raw) : [];
       if (!Array.isArray(parsed)) {
         return [];
@@ -144,10 +145,15 @@
 
   function persistNotifications() {
     try {
-      window.localStorage.setItem(NOTIFICATION_STORAGE_KEY, JSON.stringify(state.notifications.slice(0, MAX_NOTIFICATIONS)));
+      window.B2BTrendStorage?.set(NOTIFICATION_STORAGE_KEY, JSON.stringify(state.notifications.slice(0, MAX_NOTIFICATIONS)));
     } catch (_error) {
       return;
     }
+  }
+
+  async function hydrateNotifications() {
+    state.notifications = await loadNotifications();
+    renderNotifications();
   }
 
   function normalizeNotification(item) {
@@ -766,7 +772,7 @@
 
   createNotificationApi();
   bindNotificationControls();
-  pushInitialBootNotification();
+  hydrateNotifications().catch(() => pushInitialBootNotification());
   window.setTimeout(() => syncSnapshot("boot"), 0);
   startPolling();
   connectSocket();

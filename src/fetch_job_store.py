@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import json
 import threading
 import uuid
 from copy import deepcopy
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
-from src.config import ACTIVE_DATA_DIR
-
-FETCH_JOB_STATE_FILE = ACTIVE_DATA_DIR / "fetch_job_state.json"
 ACTIVE_STATUSES = {"queued", "running", "cancelling"}
 FINAL_STATUSES = {"completed", "failed", "cancelled"}
-STALE_ACTIVE_MAX_AGE = timedelta(minutes=20)
-STALE_CANCELLING_MAX_AGE = timedelta(minutes=2)
 
 
 class JobConflictError(RuntimeError):
@@ -24,9 +17,9 @@ class JobConflictError(RuntimeError):
 
 
 class FetchJobStore:
-    def __init__(self, path: Path = FETCH_JOB_STATE_FILE) -> None:
-        self.path = path
+    def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._state: dict[str, Any] = self._default_state()
 
     def _now(self) -> str:
         return datetime.now().isoformat(timespec="seconds")
@@ -34,70 +27,6 @@ class FetchJobStore:
     def _default_state(self) -> dict[str, Any]:
         now = self._now()
         return {"active": None, "latest": None, "updated_at": now}
-
-    def _read_state(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return self._default_state()
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return self._default_state()
-        if not isinstance(payload, dict):
-            return self._default_state()
-        payload.setdefault("active", None)
-        payload.setdefault("latest", None)
-        payload["updated_at"] = str(payload.get("updated_at") or self._now())
-        return payload
-
-    def _write_state(self, payload: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp_path.replace(self.path)
-
-    def _parse_iso(self, value: Any) -> datetime | None:
-        if not value:
-            return None
-        try:
-            return datetime.fromisoformat(str(value))
-        except Exception:
-            return None
-
-    def _recover_stale_active_job(self, state: dict[str, Any]) -> bool:
-        active = self._normalize_job(state.get("active"))
-        if not active or active.get("status") not in ACTIVE_STATUSES:
-            return False
-
-        now_dt = datetime.now()
-        updated_dt = self._parse_iso(active.get("updated_at")) or self._parse_iso(active.get("started_at")) or self._parse_iso(active.get("created_at"))
-        if updated_dt is None:
-            return False
-
-        age = now_dt - updated_dt
-        max_age = STALE_CANCELLING_MAX_AGE if active.get("status") == "cancelling" else STALE_ACTIVE_MAX_AGE
-        if age <= max_age:
-            return False
-
-        now = self._now()
-        if active.get("status") == "cancelling":
-            active["status"] = "cancelled"
-            active["phase"] = "cancelled"
-            active["message"] = "Veri cekimi iptal edildi (zaman asimi nedeniyle otomatik kapatildi)."
-        else:
-            active["status"] = "failed"
-            active["phase"] = "failed"
-            active["message"] = "Veri cekimi beklenmedik sekilde durdu ve otomatik temizlendi."
-            active["error"] = "stale-active-job"
-
-        active["progress"] = 1.0
-        active["cancel_requested"] = bool(active.get("cancel_requested") or active.get("status") == "cancelled")
-        active["finished_at"] = now
-        active["updated_at"] = now
-
-        state["active"] = None
-        state["latest"] = deepcopy(active)
-        state["updated_at"] = now
-        return True
 
     def _normalize_job(self, job: dict[str, Any] | None) -> dict[str, Any] | None:
         if not isinstance(job, dict):
@@ -119,18 +48,13 @@ class FetchJobStore:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            state = self._read_state()
-            if self._recover_stale_active_job(state):
-                self._write_state(state)
-            active = self._normalize_job(state.get("active"))
-            latest = self._normalize_job(state.get("latest"))
-            if active is None and latest is not None and latest.get("status") in ACTIVE_STATUSES:
-                active = deepcopy(latest)
+            active = self._normalize_job(self._state.get("active"))
+            latest = self._normalize_job(self._state.get("latest"))
             return {
                 "active": active,
                 "latest": latest,
                 "has_active": bool(active and active.get("status") in ACTIVE_STATUSES),
-                "updated_at": state.get("updated_at") or self._now(),
+                "updated_at": self._state.get("updated_at") or self._now(),
             }
 
     def start_job(
@@ -145,10 +69,7 @@ class FetchJobStore:
         resume_requested: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
-            state = self._read_state()
-            if self._recover_stale_active_job(state):
-                self._write_state(state)
-            active = self._normalize_job(state.get("active"))
+            active = self._normalize_job(self._state.get("active"))
             if active and active.get("status") in ACTIVE_STATUSES:
                 raise JobConflictError(active)
 
@@ -177,19 +98,15 @@ class FetchJobStore:
                 "resume_requested": bool(resume_requested),
                 "resume_enabled": False,
             }
-            state["active"] = deepcopy(job)
-            state["latest"] = deepcopy(job)
-            state["updated_at"] = now
-            self._write_state(state)
+            self._state["active"] = deepcopy(job)
+            self._state["latest"] = deepcopy(job)
+            self._state["updated_at"] = now
             return deepcopy(job)
 
     def update_job(self, job_id: str, **changes: Any) -> dict[str, Any] | None:
         with self._lock:
-            state = self._read_state()
-            if self._recover_stale_active_job(state):
-                self._write_state(state)
-            active = self._normalize_job(state.get("active"))
-            latest = self._normalize_job(state.get("latest"))
+            active = self._normalize_job(self._state.get("active"))
+            latest = self._normalize_job(self._state.get("latest"))
 
             job: dict[str, Any] | None = None
             if active and active.get("job_id") == job_id:
@@ -213,21 +130,17 @@ class FetchJobStore:
             if job.get("status") in FINAL_STATUSES and not job.get("finished_at"):
                 job["finished_at"] = now
             if job.get("status") in FINAL_STATUSES:
-                state["active"] = None
-                state["latest"] = deepcopy(job)
+                self._state["active"] = None
+                self._state["latest"] = deepcopy(job)
             else:
-                state["active"] = deepcopy(job)
-                state["latest"] = deepcopy(job)
-            state["updated_at"] = now
-            self._write_state(state)
+                self._state["active"] = deepcopy(job)
+                self._state["latest"] = deepcopy(job)
+            self._state["updated_at"] = now
             return deepcopy(job)
 
     def request_cancel(self, job_id: str) -> dict[str, Any] | None:
         with self._lock:
-            state = self._read_state()
-            if self._recover_stale_active_job(state):
-                self._write_state(state)
-            active = self._normalize_job(state.get("active"))
+            active = self._normalize_job(self._state.get("active"))
             if not active or active.get("job_id") != job_id or active.get("status") not in ACTIVE_STATUSES:
                 return None
 
@@ -238,10 +151,9 @@ class FetchJobStore:
             active["message"] = "Veri cekimi iptal edildi"
             active["updated_at"] = now
             active["finished_at"] = now
-            state["active"] = None
-            state["latest"] = deepcopy(active)
-            state["updated_at"] = now
-            self._write_state(state)
+            self._state["active"] = None
+            self._state["latest"] = deepcopy(active)
+            self._state["updated_at"] = now
             return deepcopy(active)
 
     def finish_job(
@@ -258,7 +170,28 @@ class FetchJobStore:
             "phase": status,
             "message": message,
             "progress": 1.0,
-            "result": result,
-            "error": error,
+            "finished_at": self._now(),
         }
+        if result is not None:
+            payload["result"] = result
+        if error is not None:
+            payload["error"] = error
         return self.update_job(job_id, **payload)
+
+    def export_state(self) -> dict[str, Any]:
+        with self._lock:
+            return deepcopy(self._state)
+
+    def import_state(self, payload: dict[str, Any] | None) -> None:
+        with self._lock:
+            if not isinstance(payload, dict):
+                self._state = self._default_state()
+                return
+            self._state = {
+                "active": self._normalize_job(payload.get("active")),
+                "latest": self._normalize_job(payload.get("latest")),
+                "updated_at": str(payload.get("updated_at") or self._now()),
+            }
+
+
+fetch_job_store = FetchJobStore()

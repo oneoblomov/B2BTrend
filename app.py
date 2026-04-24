@@ -42,13 +42,15 @@ from src.analytics import (
     stl_decompose,
     trend_strength_meter,
 )
-from src.config import ALL_COUNTRIES, DEFAULT_KEYWORD, GEOCACHE_FILE, TOP_20_COUNTRIES, USER_AGENT
+from src.config import ALL_COUNTRIES, DEFAULT_KEYWORD, TOP_20_COUNTRIES, USER_AGENT
 from src.fetch_job_store import FetchJobStore, JobConflictError
 from src.fetch_resume_store import (
     build_fetch_fingerprint,
     clear_checkpoint,
+    export_state as export_resume_state,
     is_checkpoint_compatible,
     load_checkpoint,
+    import_state as import_resume_state,
     save_checkpoint,
 )
 from src.reports import export_csv
@@ -69,11 +71,14 @@ from src.workspace_store import (
     WorkspaceValidationError,
     create_workspace,
     delete_workspace,
+    export_memory_state,
     ensure_default_workspace,
     get_default_workspace_id,
+    import_memory_state,
     list_workspaces,
     load_workspace_dataset,
     load_workspace_meta,
+    reset_memory_state,
     save_workspace_dataset,
     set_default_workspace,
     update_workspace,
@@ -94,6 +99,14 @@ jinja_env = jinja2.Environment(
 )
 templates = Jinja2Templates(env=jinja_env)
 logger = logging.getLogger(__name__)
+_GEOCACHE = pd.DataFrame(
+    {
+        "country": pd.Series(dtype="string"),
+        "city": pd.Series(dtype="string"),
+        "lat": pd.Series(dtype="float64"),
+        "lon": pd.Series(dtype="float64"),
+    }
+)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -127,6 +140,14 @@ class FetchRequest(BaseModel):
 
 class FetchCancelRequest(BaseModel):
     workspace_id: str | None = None
+
+
+class BrowserStatePayload(BaseModel):
+    workspaces: list[dict] | None = None
+    default_workspace_id: str | None = None
+    datasets: dict[str, dict] | None = None
+    checkpoints: dict[str, dict] | None = None
+    fetch_job: dict | None = None
 
 
 class CityTimelineFetchRequest(BaseModel):
@@ -628,33 +649,17 @@ def _normalize_geocode_key(value: str | None) -> str:
 
 
 def _load_geocache() -> pd.DataFrame:
-    if GEOCACHE_FILE.exists():
-        cache = pd.read_csv(GEOCACHE_FILE, dtype={"country": str, "city": str, "lat": str, "lon": str})
-        for col in ["country", "city", "lat", "lon"]:
-            if col not in cache.columns:
-                cache[col] = pd.NA
-        cache["country"] = cache["country"].fillna("").astype(str).map(_normalize_geocode_key)
-        cache["city"] = cache["city"].fillna("").astype(str).map(_normalize_geocode_key)
-        cache["lat"] = pd.to_numeric(cache["lat"], errors="coerce")
-        cache["lon"] = pd.to_numeric(cache["lon"], errors="coerce")
-        return cache[["country", "city", "lat", "lon"]]
-
-    return pd.DataFrame({
-        "country": pd.Series(dtype="string"),
-        "city": pd.Series(dtype="string"),
-        "lat": pd.Series(dtype="float64"),
-        "lon": pd.Series(dtype="float64"),
-    })
+    return _GEOCACHE.copy()
 
 
 def _save_geocache(df: pd.DataFrame) -> None:
+    global _GEOCACHE
     cache = df.copy()
     cache["country"] = cache["country"].fillna("").astype(str).map(_normalize_geocode_key)
     cache["city"] = cache["city"].fillna("").astype(str).map(_normalize_geocode_key)
     cache["lat"] = pd.to_numeric(cache["lat"], errors="coerce")
     cache["lon"] = pd.to_numeric(cache["lon"], errors="coerce")
-    GEOCACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    cache.to_csv(GEOCACHE_FILE, index=False)
+    _GEOCACHE = cache[["country", "city", "lat", "lon"]].drop_duplicates(subset=["country", "city"], keep="last").reset_index(drop=True)
 
 
 def _geocode_cities(df: pd.DataFrame) -> pd.DataFrame:
@@ -1145,6 +1150,28 @@ async def health() -> dict:
 async def api_workspaces() -> dict:
     records = [_workspace_payload(item) for item in list_workspaces()]
     return {"items": records, "default_workspace_id": get_default_workspace_id()}
+
+
+@app.get("/api/browser-state")
+async def api_browser_state_export() -> dict:
+    return {
+        "workspace": export_memory_state(),
+        "checkpoints": export_resume_state(),
+        "fetch_job": fetch_job_store.export_state(),
+    }
+
+
+@app.post("/api/browser-state")
+async def api_browser_state_import(payload: BrowserStatePayload) -> dict:
+    reset_memory_state()
+    import_memory_state({
+        "workspaces": payload.workspaces or [],
+        "default_workspace_id": payload.default_workspace_id,
+        "datasets": payload.datasets or {},
+    })
+    import_resume_state(payload.checkpoints or {})
+    fetch_job_store.import_state(payload.fetch_job or {})
+    return {"ok": True}
 
 
 @app.post("/api/workspaces")
